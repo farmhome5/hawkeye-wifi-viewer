@@ -1,0 +1,23 @@
+name: hawkeye_wifi_viewer
+description: Hawkeye WiFi Viewer
+publish_to: "none"
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  url_launcher: ^6.3.2
+  flutter_vlc_player: ^7.4.2
+
+
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/hawkeye_logo_white.png
