@@ -3,8 +3,11 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_vlc_player/flutter_vlc_player.dart';
+import 'package:network_info_plus/network_info_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -123,12 +126,25 @@ class _LiveViewState extends State<LiveView> {
   late VlcPlayerController _vlcController;
   bool _vlcReady = false; // true once platform view is initialized
   bool _isRtspMode = false;
+  int _vlcInitAttempt = 0;
+  static const int _maxVlcRetries = 3;
+
+  // WiFi name
+  String? _wifiName;
 
   @override
   void initState() {
     super.initState();
-    // Create the ONE VLC controller that lives for the app's lifetime.
-    // Start with a dummy URL; we'll use setMediaFromNetwork() to switch.
+    // Go fullscreen (hide system UI)
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    _initVlc();
+    _detectWifiName();
+  }
+
+  void _initVlc() {
+    _vlcInitAttempt++;
+    debugPrint('[HAWKEYE] VLC init attempt $_vlcInitAttempt/$_maxVlcRetries');
+
     _vlcController = VlcPlayerController.network(
       'http://127.0.0.1/', // placeholder — will be replaced
       hwAcc: HwAcc.full,
@@ -138,12 +154,12 @@ class _LiveViewState extends State<LiveView> {
           VlcAdvancedOptions.networkCaching(500),
         ]),
         extras: [
-          '--http-reconnect',         // Auto-reconnect on drops (key for borescopes)
-          '--no-sub-autodetect-file',  // Don't waste time looking for subtitles
-          '--no-stats',               // Less overhead
-          '--drop-late-frames',       // Keep in sync
-          '--skip-frames',            // Keep in sync
-          '-vvv',                     // Maximum verbose logging
+          '--http-reconnect',
+          '--no-sub-autodetect-file',
+          '--no-stats',
+          '--drop-late-frames',
+          '--skip-frames',
+          '-vvv',
         ],
         rtp: VlcRtpOptions([
           VlcRtpOptions.rtpOverRtsp(true),
@@ -151,24 +167,44 @@ class _LiveViewState extends State<LiveView> {
       ),
     );
     _vlcController.addOnInitListener(() {
-      debugPrint('[HAWKEYE] VLC platform view initialized');
+      debugPrint('[HAWKEYE] VLC platform view initialized (attempt $_vlcInitAttempt)');
       if (mounted) {
         setState(() => _vlcReady = true);
-        // Auto-probe once VLC is ready
         if (!_connecting) _probe();
       }
     });
 
-    // Also set up a fallback timer: if VLC hasn't initialized after 8s,
-    // probe anyway (in case VLC init is permanently stuck).
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      Future.delayed(const Duration(seconds: 8), () {
-        if (mounted && !_vlcReady && !_connecting) {
-          debugPrint('[HAWKEYE] VLC init timeout - probing anyway');
-          _probe();
-        }
-      });
+    // Retry: if VLC hasn't initialized after 5s, dispose and recreate
+    Future.delayed(const Duration(seconds: 5), () {
+      if (mounted && !_vlcReady && _vlcInitAttempt < _maxVlcRetries) {
+        debugPrint('[HAWKEYE] VLC init timeout - retrying (attempt ${_vlcInitAttempt + 1})');
+        _vlcController.dispose();
+        setState(() {}); // trigger rebuild with new controller
+        _initVlc();
+      } else if (mounted && !_vlcReady) {
+        debugPrint('[HAWKEYE] VLC init failed after $_maxVlcRetries attempts');
+        setState(() => _status = 'VLC failed to initialize. Restart app.');
+      }
     });
+  }
+
+  Future<void> _detectWifiName() async {
+    try {
+      final status = await Permission.location.request();
+      if (status.isGranted) {
+        final info = NetworkInfo();
+        final name = await info.getWifiName();
+        if (name != null && mounted) {
+          // Android wraps SSID in quotes — strip them
+          setState(() => _wifiName = name.replaceAll('"', ''));
+          debugPrint('[HAWKEYE] WiFi SSID: $_wifiName');
+        }
+      } else {
+        debugPrint('[HAWKEYE] Location permission denied — cannot get WiFi name');
+      }
+    } catch (e) {
+      debugPrint('[HAWKEYE] WiFi name detection failed: $e');
+    }
   }
 
   @override
@@ -494,7 +530,8 @@ class _LiveViewState extends State<LiveView> {
         setState(() => _status = 'Connecting: $url');
         final success = await _playRtspStream(url);
         if (success) {
-          setState(() => _status = 'Streaming from camera');
+          final source = _wifiName ?? 'camera';
+          setState(() => _status = 'Streaming from $source');
           return;
         }
       }
@@ -837,113 +874,63 @@ class _LiveViewState extends State<LiveView> {
 
   @override
   Widget build(BuildContext context) {
-    final url = _activeUrl ?? 'http://$_ip${_jpegCandidates[_candidateIndex]}';
+    final isStreaming = _isRtspMode ||
+        (_lastFrame != null); // MJPEG fallback or RTSP active
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Hawkeye WiFi Viewer'),
-        actions: [
-          IconButton(
-            tooltip: 'Open Web UI',
-            onPressed: _openWebUi,
-            icon: const Icon(Icons.open_in_new),
-          ),
-          IconButton(
-            tooltip: 'Set IP',
-            onPressed: _setIpPrompt,
-            icon: const Icon(Icons.settings_ethernet),
-          ),
-        ],
-      ),
-      body: Column(
+      body: Stack(
+        fit: StackFit.expand,
         children: [
-          // Status & controls
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    _status,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
+          // Fullscreen video area
+          Center(
+            child: AspectRatio(
+              aspectRatio: 1, // 400x400 camera
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  // VLC player — ALWAYS in the tree so the platform view initializes.
+                  // Use hybrid composition (virtualDisplay: false) for reliable init.
+                  VlcPlayer(
+                    controller: _vlcController,
+                    aspectRatio: 1,
+                    virtualDisplay: false,
+                    placeholder: const SizedBox.shrink(),
                   ),
-                ),
-                const SizedBox(width: 8),
-                ElevatedButton(
-                  onPressed: _probe,
-                  child: const Text('Auto-Detect'),
-                ),
-                const SizedBox(width: 8),
-                OutlinedButton(
-                  onPressed: _switchUrl,
-                  child: const Text('Next Path'),
-                ),
-              ],
+                  // MJPEG image display (overlays VLC when active)
+                  if (!_isRtspMode && _lastFrame != null)
+                    Image.memory(_lastFrame!, gaplessPlayback: true, fit: BoxFit.contain),
+                  // Loading overlay (slightly transparent so Flutter creates VLC view underneath)
+                  if (!isStreaming)
+                    Container(
+                      color: const Color(0xFE000000),
+                      child: const Center(child: CircularProgressIndicator()),
+                    ),
+                ],
+              ),
             ),
           ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-            child: Row(
-              children: [
-                ElevatedButton(
-                  onPressed: () => _startTcpStream(_ip, 7060),
-                  child: const Text('TCP :7060'),
+          // Status overlay at bottom
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.bottomCenter,
+                  end: Alignment.topCenter,
+                  colors: [Color(0xCC000000), Color(0x00000000)],
                 ),
-                const SizedBox(width: 8),
-                OutlinedButton(
-                  onPressed: _scanPorts,
-                  child: const Text('Scan Ports'),
+              ),
+              child: Text(
+                _status,
+                style: const TextStyle(
+                  color: Colors.white70,
+                  fontSize: 13,
                 ),
-                const SizedBox(width: 8),
-                OutlinedButton(
-                  onPressed: _tryRtsp,
-                  child: const Text('Try RTSP'),
-                ),
-              ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text('URL: $url', style: const TextStyle(fontSize: 12)),
-            ),
-          ),
-          // Live image area
-          Expanded(
-            child: Center(
-              child: AspectRatio(
-                aspectRatio: 1,
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: Colors.black,
-                    border: Border.all(color: Colors.white24),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      // VLC player ALWAYS in the tree so the platform view initializes.
-                      // It sits at the bottom of the stack; other widgets overlay it.
-                      VlcPlayer(
-                        controller: _vlcController,
-                        aspectRatio: 1,
-                        placeholder: const SizedBox.shrink(),
-                      ),
-                      // MJPEG image display (overlays VLC when active)
-                      if (!_isRtspMode && _lastFrame != null)
-                        Image.memory(_lastFrame!, gaplessPlayback: true, fit: BoxFit.contain),
-                      // Loading/scanning indicator (overlays VLC when not streaming)
-                      // Use slightly transparent black so Flutter doesn't skip
-                      // creating the VLC platform view underneath.
-                      if (!_isRtspMode && _lastFrame == null)
-                        Container(
-                          color: const Color(0xFE000000), // 99.6% opaque
-                          child: const Center(child: CircularProgressIndicator()),
-                        ),
-                    ],
-                  ),
-                ),
+                textAlign: TextAlign.center,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
               ),
             ),
           ),
