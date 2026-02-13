@@ -132,11 +132,20 @@ class _LiveViewState extends State<LiveView> {
   // WiFi name
   String? _wifiName;
 
+  // Video aspect ratio — auto-detected from stream (default 1:1 for Q2)
+  double _videoAspectRatio = 1.0;
+
   @override
   void initState() {
     super.initState();
-    // Go fullscreen (hide system UI)
+    // Go fullscreen and allow all orientations (TV, phone, tablet)
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
     _initVlc();
     _detectWifiName();
   }
@@ -173,6 +182,8 @@ class _LiveViewState extends State<LiveView> {
         if (!_connecting) _probe();
       }
     });
+    // Auto-detect video aspect ratio from stream dimensions
+    _vlcController.addListener(_onVlcSizeChanged);
 
     // Retry: if VLC hasn't initialized after 5s, dispose and recreate
     Future.delayed(const Duration(seconds: 5), () {
@@ -207,8 +218,20 @@ class _LiveViewState extends State<LiveView> {
     }
   }
 
+  void _onVlcSizeChanged() {
+    final size = _vlcController.value.size;
+    if (size.width > 0 && size.height > 0) {
+      final ratio = size.width / size.height;
+      if (ratio != _videoAspectRatio) {
+        debugPrint('[HAWKEYE] Video size: ${size.width}x${size.height} (ratio: ${ratio.toStringAsFixed(2)})');
+        setState(() => _videoAspectRatio = ratio);
+      }
+    }
+  }
+
   @override
   void dispose() {
+    _vlcController.removeListener(_onVlcSizeChanged);
     _stopStream();
     _vlcController.dispose();
     super.dispose();
@@ -883,7 +906,7 @@ class _LiveViewState extends State<LiveView> {
           // Fullscreen video area
           Center(
             child: AspectRatio(
-              aspectRatio: 1, // 400x400 camera
+              aspectRatio: _videoAspectRatio, // auto-detected from stream
               child: Stack(
                 fit: StackFit.expand,
                 children: [
@@ -891,7 +914,7 @@ class _LiveViewState extends State<LiveView> {
                   // Use hybrid composition (virtualDisplay: false) for reliable init.
                   VlcPlayer(
                     controller: _vlcController,
-                    aspectRatio: 1,
+                    aspectRatio: _videoAspectRatio,
                     virtualDisplay: false,
                     placeholder: const SizedBox.shrink(),
                   ),
