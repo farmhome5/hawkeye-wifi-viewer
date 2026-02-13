@@ -65,6 +65,8 @@ class MyApp extends StatelessWidget {
   }
 }
 
+enum VideoMode { flutter, nativeSurface, nativeActivity }
+
 class LiveView extends StatefulWidget {
   const LiveView({super.key});
   @override
@@ -148,6 +150,11 @@ class _LiveViewState extends State<LiveView> {
 
   // Video aspect ratio — auto-detected from stream (default 1:1 for Q2)
   double _videoAspectRatio = 1.0;
+
+  // Video mode switcher (Flutter VLC / Native Surface / Native Activity)
+  VideoMode _videoMode = VideoMode.flutter;
+  static const _nativeChannel = MethodChannel('hawkeye/native_vlc');
+  bool _nativeOverlayActive = false;
 
   @override
   void initState() {
@@ -250,11 +257,12 @@ class _LiveViewState extends State<LiveView> {
       }
     }
 
-    // Detect stream loss and auto-reconnect
+    // Detect stream loss and auto-reconnect (Flutter VLC mode only)
     final state = _vlcController.value.playingState;
     if (state != _lastPlayingState) {
       debugPrint('[HAWKEYE] VLC state: $_lastPlayingState -> $state');
-      if (_lastPlayingState == PlayingState.playing &&
+      if (_videoMode == VideoMode.flutter &&
+          _lastPlayingState == PlayingState.playing &&
           (state == PlayingState.stopped || state == PlayingState.ended || state == PlayingState.error)) {
         debugPrint('[HAWKEYE] Stream lost — reconnecting');
         setState(() {
@@ -275,6 +283,10 @@ class _LiveViewState extends State<LiveView> {
     _vlcController.removeListener(_onVlcSizeChanged);
     _stopStream();
     _vlcController.dispose();
+    // Clean up native overlay if still active
+    if (_nativeOverlayActive) {
+      _nativeChannel.invokeMethod('overlay_dispose').catchError((_) {});
+    }
     super.dispose();
   }
 
@@ -346,6 +358,74 @@ class _LiveViewState extends State<LiveView> {
   }
 
   Future<bool> _playRtspStream(String rtspUrl) async {
+    switch (_videoMode) {
+      case VideoMode.flutter:
+        return _playRtspFlutter(rtspUrl);
+      case VideoMode.nativeSurface:
+        return _playRtspNativeSurface(rtspUrl);
+      case VideoMode.nativeActivity:
+        return _playRtspNativeActivity(rtspUrl);
+    }
+  }
+
+  Future<bool> _playRtspNativeSurface(String rtspUrl) async {
+    try {
+      debugPrint('[HAWKEYE] Native Surface mode: $rtspUrl');
+      await _nativeChannel.invokeMethod('overlay_init');
+      await _nativeChannel.invokeMethod('overlay_play', {'url': rtspUrl});
+      setState(() {
+        _nativeOverlayActive = true;
+        _isRtspMode = true;
+        _activeUrl = rtspUrl;
+        _status = 'Native Surface: $rtspUrl';
+      });
+      // Brief wait then check if playing
+      await Future.delayed(const Duration(seconds: 2));
+      final playing = await _nativeChannel.invokeMethod<bool>('overlay_isPlaying') ?? false;
+      if (playing) {
+        final source = _wifiName ?? 'camera';
+        setState(() => _status = 'Native Surface streaming from $source');
+        return true;
+      }
+      // Give more time for stream to start
+      await Future.delayed(const Duration(seconds: 3));
+      final playingRetry = await _nativeChannel.invokeMethod<bool>('overlay_isPlaying') ?? false;
+      if (playingRetry) {
+        final source = _wifiName ?? 'camera';
+        setState(() => _status = 'Native Surface streaming from $source');
+        return true;
+      }
+      debugPrint('[HAWKEYE] Native Surface: not playing after 5s');
+      await _nativeChannel.invokeMethod('overlay_stop');
+      setState(() => _nativeOverlayActive = false);
+      return false;
+    } catch (e) {
+      debugPrint('[HAWKEYE] Native Surface error: $e');
+      setState(() {
+        _nativeOverlayActive = false;
+        _status = 'Native Surface failed: $e';
+      });
+      return false;
+    }
+  }
+
+  Future<bool> _playRtspNativeActivity(String rtspUrl) async {
+    try {
+      debugPrint('[HAWKEYE] Native Activity mode: $rtspUrl');
+      await _nativeChannel.invokeMethod('launch_native_activity', {'url': rtspUrl});
+      setState(() {
+        _activeUrl = rtspUrl;
+        _status = 'Launched Native Activity: $rtspUrl';
+      });
+      return true; // Activity handles its own lifecycle
+    } catch (e) {
+      debugPrint('[HAWKEYE] Native Activity error: $e');
+      setState(() => _status = 'Native Activity failed: $e');
+      return false;
+    }
+  }
+
+  Future<bool> _playRtspFlutter(String rtspUrl) async {
     try {
       // Stop any existing non-VLC streams
       _running = false;
@@ -495,8 +575,8 @@ class _LiveViewState extends State<LiveView> {
       //   3. VLC plays rtsp://camera:554/preview (H.264 400x400 30fps)
       // ============================================================
 
-      // Brief wait for VLC if it's not ready yet
-      if (!_vlcReady) {
+      // Brief wait for VLC if it's not ready yet (skip for native modes)
+      if (!_vlcReady && _videoMode == VideoMode.flutter) {
         setState(() => _status = 'Waiting for VLC...');
         for (int w = 0; w < 8; w++) {
           await Future.delayed(const Duration(milliseconds: 250));
@@ -580,8 +660,8 @@ class _LiveViewState extends State<LiveView> {
         await Future.delayed(const Duration(milliseconds: 200));
       }
 
-      // STEP 4: Play RTSP stream via VLC
-      if (!_vlcReady) {
+      // STEP 4: Play RTSP stream
+      if (!_vlcReady && _videoMode == VideoMode.flutter) {
         setState(() => _status = 'VLC not initialized. Tap Auto-Detect to retry.');
         return;
       }
@@ -750,6 +830,14 @@ class _LiveViewState extends State<LiveView> {
     try {
       await _vlcController.stop();
     } catch (_) {}
+    // Stop native overlay if active
+    if (_nativeOverlayActive) {
+      try {
+        await _nativeChannel.invokeMethod('overlay_stop');
+        await _nativeChannel.invokeMethod('overlay_dispose');
+      } catch (_) {}
+      _nativeOverlayActive = false;
+    }
     // Close WebSocket command channel
     try {
       await _cameraWs?.close();
@@ -942,49 +1030,64 @@ class _LiveViewState extends State<LiveView> {
 
   // ---- UI -------------------------------------------------------------------
 
+  String get _modeLabel {
+    switch (_videoMode) {
+      case VideoMode.flutter: return 'Flutter VLC';
+      case VideoMode.nativeSurface: return 'Native Surface';
+      case VideoMode.nativeActivity: return 'Native Activity';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final isStreaming = _isRtspMode ||
         (_lastFrame != null); // MJPEG fallback or RTSP active
+    // In native surface mode, make the Flutter video area transparent
+    // so the native SurfaceView behind shows through.
+    final useTransparentVideo = _videoMode == VideoMode.nativeSurface && _nativeOverlayActive;
     return Scaffold(
+      backgroundColor: useTransparentVideo ? Colors.transparent : null,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // Fullscreen video area — let VLC fill the screen,
-          // it maintains correct aspect ratio internally.
-          Stack(
-            fit: StackFit.expand,
-            children: [
-              // VLC player — ALWAYS in the tree so the platform view initializes.
-              // Use hybrid composition (virtualDisplay: false) for reliable init.
-              // Opacity hides old frame during reconnection (surface retains last frame).
-              Opacity(
-                opacity: _isRtspMode ? 1.0 : 0.0,
-                child: VlcPlayer(
-                  controller: _vlcController,
-                  aspectRatio: _videoAspectRatio,
-                  virtualDisplay: false,
-                  placeholder: const SizedBox.shrink(),
+          // Fullscreen video area
+          if (useTransparentVideo)
+            // Transparent — native SurfaceView renders behind Flutter
+            const SizedBox.expand()
+          else
+            Stack(
+              fit: StackFit.expand,
+              children: [
+                // VLC player — ALWAYS in the tree so the platform view initializes.
+                // Use hybrid composition (virtualDisplay: false) for reliable init.
+                // Opacity hides old frame during reconnection (surface retains last frame).
+                Opacity(
+                  opacity: _isRtspMode && _videoMode == VideoMode.flutter ? 1.0 : 0.0,
+                  child: VlcPlayer(
+                    controller: _vlcController,
+                    aspectRatio: _videoAspectRatio,
+                    virtualDisplay: false,
+                    placeholder: const SizedBox.shrink(),
+                  ),
                 ),
-              ),
-              // MJPEG image display (overlays VLC when active)
-              if (!_isRtspMode && _lastFrame != null)
-                Center(child: Image.memory(_lastFrame!, gaplessPlayback: true, fit: BoxFit.contain)),
-              // Loading overlay (slightly transparent so Flutter creates VLC view underneath)
-              if (!isStreaming)
-                Container(
-                  color: const Color(0xFE000000),
-                  child: const Center(child: CircularProgressIndicator()),
-                ),
-            ],
-          ),
-          // Status overlay at bottom
+                // MJPEG image display (overlays VLC when active)
+                if (!_isRtspMode && _lastFrame != null)
+                  Center(child: Image.memory(_lastFrame!, gaplessPlayback: true, fit: BoxFit.contain)),
+                // Loading overlay (slightly transparent so Flutter creates VLC view underneath)
+                if (!isStreaming)
+                  Container(
+                    color: const Color(0xFE000000),
+                    child: const Center(child: CircularProgressIndicator()),
+                  ),
+              ],
+            ),
+          // Status overlay at bottom with mode switcher
           Positioned(
             left: 0,
             right: 0,
             bottom: 0,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               decoration: const BoxDecoration(
                 gradient: LinearGradient(
                   begin: Alignment.bottomCenter,
@@ -992,20 +1095,73 @@ class _LiveViewState extends State<LiveView> {
                   colors: [Color(0xCC000000), Color(0x00000000)],
                 ),
               ),
-              child: Text(
-                _status,
-                style: const TextStyle(
-                  color: Colors.white70,
-                  fontSize: 13,
-                ),
-                textAlign: TextAlign.center,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
+              child: Row(
+                children: [
+                  // Mode switcher button
+                  PopupMenuButton<VideoMode>(
+                    icon: const Icon(Icons.tune, color: Colors.white70, size: 20),
+                    tooltip: 'Video mode',
+                    color: const Color(0xFF2a2a2a),
+                    onSelected: _onModeSelected,
+                    itemBuilder: (context) => [
+                      PopupMenuItem(
+                        value: VideoMode.flutter,
+                        child: Text(
+                          'Flutter VLC${_videoMode == VideoMode.flutter ? '  \u2713' : ''}',
+                          style: const TextStyle(color: Colors.white, fontSize: 13),
+                        ),
+                      ),
+                      PopupMenuItem(
+                        value: VideoMode.nativeSurface,
+                        child: Text(
+                          'Native Surface (Exp.1)${_videoMode == VideoMode.nativeSurface ? '  \u2713' : ''}',
+                          style: const TextStyle(color: Colors.white, fontSize: 13),
+                        ),
+                      ),
+                      PopupMenuItem(
+                        value: VideoMode.nativeActivity,
+                        child: Text(
+                          'Native Activity (Exp.2)${_videoMode == VideoMode.nativeActivity ? '  \u2713' : ''}',
+                          style: const TextStyle(color: Colors.white, fontSize: 13),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(width: 4),
+                  // Status text
+                  Expanded(
+                    child: Text(
+                      '[$_modeLabel] $_status',
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 13,
+                      ),
+                      textAlign: TextAlign.center,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
         ],
       ),
     );
+  }
+
+  void _onModeSelected(VideoMode mode) async {
+    if (mode == _videoMode) return;
+    debugPrint('[HAWKEYE] Switching video mode: $_videoMode -> $mode');
+    // Stop current stream
+    await _stopStream();
+    setState(() {
+      _videoMode = mode;
+      _isRtspMode = false;
+      _lastFrame = null;
+      _status = 'Mode: $_modeLabel — reconnecting...';
+    });
+    // Re-probe with new mode
+    _probe();
   }
 }
