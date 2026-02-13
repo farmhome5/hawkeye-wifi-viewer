@@ -218,6 +218,8 @@ class _LiveViewState extends State<LiveView> {
     }
   }
 
+  PlayingState _lastPlayingState = PlayingState.stopped;
+
   void _onVlcSizeChanged() {
     final size = _vlcController.value.size;
     if (size.width > 0 && size.height > 0) {
@@ -226,6 +228,24 @@ class _LiveViewState extends State<LiveView> {
         debugPrint('[HAWKEYE] Video size: ${size.width}x${size.height} (ratio: ${ratio.toStringAsFixed(2)})');
         setState(() => _videoAspectRatio = ratio);
       }
+    }
+
+    // Detect stream loss and auto-reconnect
+    final state = _vlcController.value.playingState;
+    if (state != _lastPlayingState) {
+      debugPrint('[HAWKEYE] VLC state: $_lastPlayingState -> $state');
+      if (_lastPlayingState == PlayingState.playing &&
+          (state == PlayingState.stopped || state == PlayingState.ended || state == PlayingState.error)) {
+        debugPrint('[HAWKEYE] Stream lost — reconnecting in 2s');
+        setState(() {
+          _isRtspMode = false;
+          _status = 'Stream lost — reconnecting...';
+        });
+        Future.delayed(const Duration(seconds: 2), () {
+          if (mounted && !_connecting) _probe();
+        });
+      }
+      _lastPlayingState = state;
     }
   }
 
@@ -903,33 +923,29 @@ class _LiveViewState extends State<LiveView> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // Fullscreen video area
-          Center(
-            child: AspectRatio(
-              aspectRatio: _videoAspectRatio, // auto-detected from stream
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  // VLC player — ALWAYS in the tree so the platform view initializes.
-                  // Use hybrid composition (virtualDisplay: false) for reliable init.
-                  VlcPlayer(
-                    controller: _vlcController,
-                    aspectRatio: _videoAspectRatio,
-                    virtualDisplay: false,
-                    placeholder: const SizedBox.shrink(),
-                  ),
-                  // MJPEG image display (overlays VLC when active)
-                  if (!_isRtspMode && _lastFrame != null)
-                    Image.memory(_lastFrame!, gaplessPlayback: true, fit: BoxFit.contain),
-                  // Loading overlay (slightly transparent so Flutter creates VLC view underneath)
-                  if (!isStreaming)
-                    Container(
-                      color: const Color(0xFE000000),
-                      child: const Center(child: CircularProgressIndicator()),
-                    ),
-                ],
+          // Fullscreen video area — let VLC fill the screen,
+          // it maintains correct aspect ratio internally.
+          Stack(
+            fit: StackFit.expand,
+            children: [
+              // VLC player — ALWAYS in the tree so the platform view initializes.
+              // Use hybrid composition (virtualDisplay: false) for reliable init.
+              VlcPlayer(
+                controller: _vlcController,
+                aspectRatio: _videoAspectRatio,
+                virtualDisplay: false,
+                placeholder: const SizedBox.shrink(),
               ),
-            ),
+              // MJPEG image display (overlays VLC when active)
+              if (!_isRtspMode && _lastFrame != null)
+                Center(child: Image.memory(_lastFrame!, gaplessPlayback: true, fit: BoxFit.contain)),
+              // Loading overlay (slightly transparent so Flutter creates VLC view underneath)
+              if (!isStreaming)
+                Container(
+                  color: const Color(0xFE000000),
+                  child: const Center(child: CircularProgressIndicator()),
+                ),
+            ],
           ),
           // Status overlay at bottom
           Positioned(
