@@ -11,7 +11,21 @@ import 'package:permission_handler/permission_handler.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const MyApp());
+
+  // Catch all Flutter framework errors
+  FlutterError.onError = (details) {
+    debugPrint('[HAWKEYE] FlutterError: ${details.exception}');
+    debugPrint('[HAWKEYE] ${details.stack}');
+  };
+
+  // Catch all unhandled async errors (fatal in release mode without this)
+  runZonedGuarded(
+    () => runApp(const MyApp()),
+    (error, stack) {
+      debugPrint('[HAWKEYE] Uncaught error: $error');
+      debugPrint('[HAWKEYE] $stack');
+    },
+  );
 }
 
 class MyApp extends StatelessWidget {
@@ -160,7 +174,7 @@ class _LiveViewState extends State<LiveView> {
       autoPlay: false,
       options: VlcPlayerOptions(
         advanced: VlcAdvancedOptions([
-          VlcAdvancedOptions.networkCaching(500),
+          VlcAdvancedOptions.networkCaching(100),
         ]),
         extras: [
           '--http-reconnect',
@@ -168,10 +182,16 @@ class _LiveViewState extends State<LiveView> {
           '--no-stats',
           '--drop-late-frames',
           '--skip-frames',
-          '-vvv',
+          '--live-caching=0',
+          '--file-caching=0',
+          '--disc-caching=0',
+          '--clock-jitter=0',
+          '--clock-synchro=0',
+          '--avcodec-hurry-up',
+          '--no-audio',
         ],
         rtp: VlcRtpOptions([
-          VlcRtpOptions.rtpOverRtsp(true),
+          VlcRtpOptions.rtpOverRtsp(true), // TCP for reliable delivery
         ]),
       ),
     );
@@ -236,12 +256,13 @@ class _LiveViewState extends State<LiveView> {
       debugPrint('[HAWKEYE] VLC state: $_lastPlayingState -> $state');
       if (_lastPlayingState == PlayingState.playing &&
           (state == PlayingState.stopped || state == PlayingState.ended || state == PlayingState.error)) {
-        debugPrint('[HAWKEYE] Stream lost — reconnecting in 2s');
+        debugPrint('[HAWKEYE] Stream lost — reconnecting');
         setState(() {
           _isRtspMode = false;
-          _status = 'Stream lost — reconnecting...';
+          _status = 'Reconnecting...';
         });
-        Future.delayed(const Duration(seconds: 2), () {
+        try { _vlcController.stop(); } catch (_) {}
+        Future.delayed(const Duration(milliseconds: 500), () {
           if (mounted && !_connecting) _probe();
         });
       }
@@ -366,7 +387,7 @@ class _LiveViewState extends State<LiveView> {
       );
 
       setState(() {
-        _isRtspMode = true;
+        _isRtspMode = false; // keep overlay visible until new video arrives
         _lastFrame = null;
         _activeUrl = rtspUrl;
         _status = 'VLC connecting: $rtspUrl';
@@ -378,8 +399,14 @@ class _LiveViewState extends State<LiveView> {
         final state = _vlcController.value.playingState;
         final size = _vlcController.value.size;
         debugPrint('[HAWKEYE] VLC playing state after ${(i+1)*0.5}s: $state size=$size');
-        if (state == PlayingState.playing || state == PlayingState.buffering) {
-          setState(() => _status = 'VLC streaming: $rtspUrl');
+        if (state == PlayingState.playing) {
+          // Brief wait for new frames to render on the surface
+          await Future.delayed(const Duration(milliseconds: 200));
+          if (!mounted) return false;
+          setState(() {
+            _isRtspMode = true;
+            _status = 'VLC streaming: $rtspUrl';
+          });
           return true;
         }
         if (state == PlayingState.error || state == PlayingState.stopped) {
@@ -930,11 +957,15 @@ class _LiveViewState extends State<LiveView> {
             children: [
               // VLC player — ALWAYS in the tree so the platform view initializes.
               // Use hybrid composition (virtualDisplay: false) for reliable init.
-              VlcPlayer(
-                controller: _vlcController,
-                aspectRatio: _videoAspectRatio,
-                virtualDisplay: false,
-                placeholder: const SizedBox.shrink(),
+              // Opacity hides old frame during reconnection (surface retains last frame).
+              Opacity(
+                opacity: _isRtspMode ? 1.0 : 0.0,
+                child: VlcPlayer(
+                  controller: _vlcController,
+                  aspectRatio: _videoAspectRatio,
+                  virtualDisplay: false,
+                  placeholder: const SizedBox.shrink(),
+                ),
               ),
               // MJPEG image display (overlays VLC when active)
               if (!_isRtspMode && _lastFrame != null)
