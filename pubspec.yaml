@@ -16,8 +16,16 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  flutter_launcher_icons: ^0.14.3
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/HawkEyewifi.png"
+  adaptive_icon_background: "#1a1a2e"
+  adaptive_icon_foreground: "assets/HawkEyewifi.png"
 
 flutter:
   uses-material-design: true
   assets:
-    - assets/hawkeye_logo_white.png
+    - assets/HawkEyewifi.png
