@@ -57,6 +57,9 @@ vs_borescope_extracted/
 tmpclaude-*
 nul
 tablet_screenshot*.png
+logcat_*.txt
+crash_log.txt
+hawkeye_*.png
 
 # Claude Code local settings
 .claude/
