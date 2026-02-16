@@ -1,6 +1,7 @@
 package com.hawkeye.wifi.viewer
 
-import android.content.Intent
+import android.content.res.Configuration
+import android.graphics.Color
 import android.util.Log
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -19,46 +20,88 @@ class MainActivity : FlutterActivity() {
     }
 
     // Approach 1: native SurfaceView behind transparent Flutter
+    private var methodChannel: MethodChannel? = null
     private var overlaySurfaceView: SurfaceView? = null
     private var vlcHelper: NativeVlcHelper? = null
     private var pendingPlayUrl: String? = null
+    private var videoWidth: Int = 0
+    private var videoHeight: Int = 0
 
     override fun getTransparencyMode(): TransparencyMode = TransparencyMode.transparent
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
-            .setMethodCallHandler { call, result ->
-                when (call.method) {
-                    "overlay_init" -> {
-                        overlayInit()
-                        result.success(true)
-                    }
-                    "overlay_play" -> {
-                        val url = call.argument<String>("url") ?: ""
-                        overlayPlay(url)
-                        result.success(true)
-                    }
-                    "overlay_stop" -> {
-                        overlayStop()
-                        result.success(true)
-                    }
-                    "overlay_dispose" -> {
-                        overlayDispose()
-                        result.success(true)
-                    }
-                    "overlay_isPlaying" -> {
-                        result.success(vlcHelper?.isPlaying == true)
-                    }
-                    "launch_native_activity" -> {
-                        val url = call.argument<String>("url") ?: ""
-                        launchNativeActivity(url)
-                        result.success(true)
-                    }
-                    else -> result.notImplemented()
+        methodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        methodChannel!!.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "overlay_init" -> {
+                    overlayInit()
+                    result.success(true)
                 }
+                "overlay_play" -> {
+                    val url = call.argument<String>("url") ?: ""
+                    overlayPlay(url)
+                    result.success(true)
+                }
+                "overlay_stop" -> {
+                    overlayStop()
+                    result.success(true)
+                }
+                "overlay_dispose" -> {
+                    overlayDispose()
+                    result.success(true)
+                }
+                "overlay_isPlaying" -> {
+                    result.success(vlcHelper?.isPlaying == true)
+                }
+                "overlay_getVideoSize" -> {
+                    result.success(mapOf("width" to videoWidth, "height" to videoHeight))
+                }
+                else -> result.notImplemented()
             }
+        }
+    }
+
+    // --- VLC event callback: forwards events to Flutter via MethodChannel ---
+
+    private val vlcCallback = object : VlcEventCallback {
+        override fun onPlaying() {
+            runOnUiThread {
+                methodChannel?.invokeMethod("nativeEvent", mapOf("event" to "playing"))
+            }
+        }
+
+        override fun onError() {
+            runOnUiThread {
+                methodChannel?.invokeMethod("nativeEvent", mapOf("event" to "error"))
+            }
+        }
+
+        override fun onEndReached() {
+            runOnUiThread {
+                methodChannel?.invokeMethod("nativeEvent", mapOf("event" to "ended"))
+            }
+        }
+
+        override fun onStopped() {
+            runOnUiThread {
+                methodChannel?.invokeMethod("nativeEvent", mapOf("event" to "stopped"))
+            }
+        }
+
+        override fun onVideoSizeChanged(width: Int, height: Int) {
+            runOnUiThread {
+                videoWidth = width
+                videoHeight = height
+                methodChannel?.invokeMethod("nativeEvent", mapOf(
+                    "event" to "videoSize",
+                    "width" to width,
+                    "height" to height
+                ))
+            }
+        }
+
     }
 
     // --- Approach 1: SurfaceView overlay behind Flutter ---
@@ -75,6 +118,7 @@ class MainActivity : FlutterActivity() {
         val root = findViewById<ViewGroup>(android.R.id.content)
         val container = root.getChildAt(0) as? ViewGroup ?: root
 
+        // SurfaceView stays MATCH_PARENT always — VLC handles aspect ratio/centering internally
         overlaySurfaceView = SurfaceView(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -94,6 +138,9 @@ class MainActivity : FlutterActivity() {
 
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
                 Log.d(TAG, "overlay surfaceChanged: ${width}x$height")
+                // Surface resized (e.g. rotation) — tell VLC the new window dimensions
+                // VLC will re-scale and re-center the video automatically
+                vlcHelper?.updateWindowSize(width, height)
             }
 
             override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -106,10 +153,11 @@ class MainActivity : FlutterActivity() {
         // Add SurfaceView at index 0 so it's behind the Flutter view
         container.addView(overlaySurfaceView, 0)
 
-        // Initialize VLC helper
+        // Initialize VLC helper with event callback
         if (vlcHelper == null) {
             vlcHelper = NativeVlcHelper(applicationContext)
         }
+        vlcHelper?.eventCallback = vlcCallback
     }
 
     private fun overlayPlay(url: String) {
@@ -131,6 +179,16 @@ class MainActivity : FlutterActivity() {
         val sv = overlaySurfaceView ?: return
         helper.stop()
         helper.detachSurface()
+        // Clear surface to black to avoid ghost frame from previous stream
+        try {
+            val canvas = sv.holder.lockCanvas()
+            if (canvas != null) {
+                canvas.drawColor(Color.BLACK)
+                sv.holder.unlockCanvasAndPost(canvas)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "clearSurface: $e")
+        }
         helper.attachToSurface(sv)
         helper.play(url)
         Log.d(TAG, "overlay playing: $url")
@@ -143,6 +201,9 @@ class MainActivity : FlutterActivity() {
 
     private fun overlayDispose() {
         Log.d(TAG, "overlay dispose")
+        videoWidth = 0
+        videoHeight = 0
+        vlcHelper?.eventCallback = null
         vlcHelper?.release()
         vlcHelper = null
         pendingPlayUrl = null
@@ -153,14 +214,14 @@ class MainActivity : FlutterActivity() {
         overlaySurfaceView = null
     }
 
-    // --- Approach 2: Launch NativeVideoActivity ---
-
-    private fun launchNativeActivity(url: String) {
-        Log.d(TAG, "launching NativeVideoActivity: $url")
-        val intent = Intent(this, NativeVideoActivity::class.java).apply {
-            putExtra(NativeVideoActivity.EXTRA_RTSP_URL, url)
-        }
-        startActivity(intent)
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        Log.d(TAG, "onConfigurationChanged: orientation=${newConfig.orientation}")
+        // Defer VLC window size update until the surface has settled with new dimensions
+        overlaySurfaceView?.postDelayed({
+            val sv = overlaySurfaceView ?: return@postDelayed
+            vlcHelper?.updateWindowSize(sv.width, sv.height)
+        }, 150)
     }
 
     override fun onDestroy() {
