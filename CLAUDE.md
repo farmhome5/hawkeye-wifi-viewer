@@ -20,8 +20,13 @@ android/app/src/main/kotlin/  # Native Kotlin source
     NativeVlcHelper.kt        # Shared VLC setup (low-latency config)
 android/app/build.gradle.kts  # App-level build config
 android/build.gradle.kts      # Project-level build config
+assets/HawkEyewifi.png        # App launcher icon source (256x256)
 pubspec.yaml                  # Flutter dependencies
 ```
+
+## App Icon
+
+Source: `assets/HawkEyewifi.png`. Generated via `flutter_launcher_icons` (configured in `pubspec.yaml`). To regenerate after replacing the source PNG: `dart run flutter_launcher_icons`
 
 ## Architecture
 
