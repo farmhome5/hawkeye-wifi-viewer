@@ -17,7 +17,6 @@ lib/                          # Flutter/Dart source (UI + logic)
 android/app/src/main/kotlin/  # Native Kotlin source
   com/hawkeye/wifi/viewer/
     MainActivity.kt           # Flutter activity + native VLC bridge via MethodChannel
-    NativeVideoActivity.kt    # Standalone fullscreen RTSP activity
     NativeVlcHelper.kt        # Shared VLC setup (low-latency config)
 android/app/build.gradle.kts  # App-level build config
 android/build.gradle.kts      # Project-level build config

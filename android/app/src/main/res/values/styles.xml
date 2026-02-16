@@ -15,8 +15,4 @@
     <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
         <item name="android:windowBackground">?android:colorBackground</item>
     </style>
-    <!-- Fullscreen black theme for NativeVideoActivity (Approach 2) -->
-    <style name="NativeVideoTheme" parent="@android:style/Theme.Black.NoTitleBar.Fullscreen">
-        <item name="android:windowBackground">@android:color/black</item>
-    </style>
 </resources>

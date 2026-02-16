@@ -2,6 +2,5 @@
 -keep class org.videolan.** { *; }
 -dontwarn org.videolan.**
 
-# Keep native video classes (used via MethodChannel / Intent)
+# Keep native video classes (used via MethodChannel)
 -keep class com.hawkeye.wifi.viewer.NativeVlcHelper { *; }
--keep class com.hawkeye.wifi.viewer.NativeVideoActivity { *; }
