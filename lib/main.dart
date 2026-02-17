@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:network_info_plus/network_info_plus.dart';
@@ -101,6 +102,10 @@ class _LiveViewState extends State<LiveView> {
   // WiFi name
   String? _wifiName;
 
+  // WiFi connectivity monitoring
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
+  bool _hasWifi = false;
+
   // Video aspect ratio — auto-detected from stream
   double _videoAspectRatio = 1.0;
 
@@ -115,6 +120,7 @@ class _LiveViewState extends State<LiveView> {
       DeviceOrientation.landscapeRight,
     ]);
     _nativeChannel.setMethodCallHandler(_onNativeMethodCall);
+    _initConnectivityMonitor();
     _detectWifiName();
     _probe();
   }
@@ -172,6 +178,15 @@ class _LiveViewState extends State<LiveView> {
 
   void _scheduleNativeReconnect() {
     _reconnectTimer?.cancel();
+
+    // Don't waste attempts when WiFi is known to be down —
+    // the connectivity listener will re-probe when WiFi returns.
+    if (!_hasWifi) {
+      debugPrint('[HAWKEYE] No WiFi — skipping reconnect, waiting for connectivity');
+      setState(() => _status = 'WiFi disconnected — waiting for network...');
+      return;
+    }
+
     if (_reconnectAttempt >= _maxReconnectAttempts) {
       setState(() => _status = 'Reconnect failed after $_maxReconnectAttempts attempts.');
       _reconnectAttempt = 0;
@@ -251,8 +266,51 @@ class _LiveViewState extends State<LiveView> {
     }
   }
 
+  void _initConnectivityMonitor() {
+    // Seed initial WiFi state
+    Connectivity().checkConnectivity().then((results) {
+      _hasWifi = results.contains(ConnectivityResult.wifi);
+      debugPrint('[HAWKEYE] Initial connectivity: $results (wifi=$_hasWifi)');
+    });
+
+    _connectivitySub = Connectivity().onConnectivityChanged.listen((results) {
+      final wifiNow = results.contains(ConnectivityResult.wifi);
+      final hadWifi = _hasWifi;
+      _hasWifi = wifiNow;
+
+      debugPrint('[HAWKEYE] Connectivity changed: $results (wifi: $hadWifi→$wifiNow)');
+
+      if (wifiNow && !hadWifi) {
+        // WiFi restored — reset and re-probe if not already streaming
+        debugPrint('[HAWKEYE] WiFi restored — will re-probe');
+        _reconnectTimer?.cancel();
+        _reconnectAttempt = 0;
+        _lastRtspUrl = null;
+        _detectWifiName();
+        if (!_connecting && _nativeSurfaceState != 'playing') {
+          setState(() => _status = 'WiFi restored — reconnecting...');
+          _probe();
+        }
+      } else if (!wifiNow && hadWifi) {
+        // WiFi lost — stop wasting reconnect attempts, wait for network
+        debugPrint('[HAWKEYE] WiFi lost — pausing reconnect');
+        _reconnectTimer?.cancel();
+        _reconnectAttempt = 0;
+        _nativeChannel.invokeMethod('overlay_stop').catchError((_) {});
+        if (mounted) {
+          setState(() {
+            _isRtspMode = false;
+            _nativeSurfaceState = 'stopped';
+            _status = 'WiFi disconnected — waiting for network...';
+          });
+        }
+      }
+    });
+  }
+
   @override
   void dispose() {
+    _connectivitySub?.cancel();
     _reconnectTimer?.cancel();
     _nativeChannel.setMethodCallHandler(null);
     if (_nativeOverlayActive) {
@@ -443,7 +501,7 @@ class _LiveViewState extends State<LiveView> {
     }
   }
 
-  // ---- UI -------------------------------------------------------------------
+  // ---- UI ----------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
