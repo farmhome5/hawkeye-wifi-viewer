@@ -89,6 +89,7 @@ cd android && ./gradlew assembleDebug
 ## Key Dependencies
 
 **Flutter (pubspec.yaml):**
+- `connectivity_plus` — WiFi connectivity monitoring (auto-reconnect on WiFi restore)
 - `network_info_plus` — WiFi network detection
 - `permission_handler` — runtime permissions
 
