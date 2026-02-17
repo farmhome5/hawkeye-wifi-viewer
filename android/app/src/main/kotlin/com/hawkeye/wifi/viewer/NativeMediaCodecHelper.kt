@@ -58,13 +58,17 @@ class NativeMediaCodecHelper(private val context: Context) {
             override fun onRtspStatusDisconnected() {
                 Log.d(TAG, "RTSP: disconnected")
                 isCurrentlyPlaying = false
-                uiHandler.post { eventCallback?.onEndReached() }
+                uiHandler.post {
+                    sv.keepScreenOn = false
+                    eventCallback?.onEndReached()
+                }
             }
 
             override fun onRtspStatusFailedUnauthorized() {
                 Log.e(TAG, "RTSP: unauthorized")
                 isCurrentlyPlaying = false
                 uiHandler.post {
+                    sv.keepScreenOn = false
                     Log.e(TAG, "Firing error event: unauthorized")
                     eventCallback?.onError()
                 }
@@ -74,6 +78,7 @@ class NativeMediaCodecHelper(private val context: Context) {
                 Log.e(TAG, "RTSP: failed - $message")
                 isCurrentlyPlaying = false
                 uiHandler.post {
+                    sv.keepScreenOn = false
                     Log.e(TAG, "Firing error event: $message")
                     eventCallback?.onError()
                 }
@@ -82,7 +87,10 @@ class NativeMediaCodecHelper(private val context: Context) {
             override fun onRtspFirstFrameRendered() {
                 Log.d(TAG, "RTSP: first frame rendered")
                 isCurrentlyPlaying = true
-                uiHandler.post { eventCallback?.onPlaying() }
+                uiHandler.post {
+                    sv.keepScreenOn = true
+                    eventCallback?.onPlaying()
+                }
             }
 
             override fun onRtspFrameSizeChanged(width: Int, height: Int) {
@@ -182,7 +190,10 @@ class NativeMediaCodecHelper(private val context: Context) {
         }
     }
 
-    val isPlaying: Boolean get() = isCurrentlyPlaying
+    val isPlaying: Boolean get() {
+        val sv = rtspSurfaceView ?: return false
+        return isCurrentlyPlaying && sv.holder.surface.isValid
+    }
 
     fun getVideoSize(): Pair<Int, Int> = Pair(videoWidth, videoHeight)
 

@@ -37,9 +37,25 @@ RtspSurfaceView (aspect-ratio-sized) behind transparent Flutter UI (`Transparenc
 
 ### Event Flow
 
-RTSP events flow: `RtspStatusListener` → `NativeMediaCodecHelper` → `VlcEventCallback` → `MainActivity` → MethodChannel `nativeEvent` → Flutter `_onNativeMethodCall`. Events: `playing`, `error`, `ended`, `stopped`, `videoSize`.
+RTSP events flow: `RtspStatusListener` → `NativeMediaCodecHelper` → `VlcEventCallback` → `MainActivity` → MethodChannel `nativeEvent` → Flutter `_onNativeMethodCall`. Events: `playing`, `error`, `ended`, `stopped`, `videoSize`, `foregrounded`.
 
 Auto-reconnect uses a two-tier strategy: fast replay (first 6 attempts at 500ms intervals, just retries the same RTSP URL) then falls back to full probe with exponential backoff (300ms–5s). Max 10 total attempts.
+
+### Recovery & Resilience
+
+Multiple layers handle stream recovery:
+
+1. **Fast replay / full probe** — handles brief stream interruptions while WiFi is up
+2. **Connectivity monitoring** (`connectivity_plus`) — detects WiFi drop/restore, pauses reconnect when offline, re-probes on WiFi restore
+3. **Native lifecycle** (`onStop`/`onStart`) — `MainActivity.onStop()` stops the stream, `onStart()` sends `foregrounded` event to Flutter for a fresh probe. More reliable than Flutter's `WidgetsBindingObserver` on Samsung devices.
+4. **Watchdog timer** (5s) — queries native `overlay_isPlaying` (checks `surface.isValid`) to detect silently-dead streams (e.g. surface destroyed without RTSP disconnect event). Force-resets stuck probes.
+5. **Probe generation counter** (`_probeId`) — prevents stale async probes from interfering when a newer probe is started by lifecycle/watchdog.
+
+On every reconnect, the overlay is fully disposed and recreated (`overlay_dispose` + `overlay_init`) to prevent pixelation from stale decoder state.
+
+### Screen Wake Lock
+
+`keepScreenOn` is set on the RtspSurfaceView when the stream starts playing, and cleared when it stops. This prevents the device from sleeping while actively streaming.
 
 ### Aspect Ratio Handling
 
@@ -63,7 +79,7 @@ Channel: `hawkeye/native_vlc`
 | `overlay_dispose`    | Flutter→Native | Release resources              |
 | `overlay_isPlaying`  | Flutter→Native | Query playback state           |
 | `overlay_getVideoSize` | Flutter→Native | Get current video dimensions  |
-| `nativeEvent`        | Native→Flutter | RTSP events (playing/error/ended/stopped/videoSize) |
+| `nativeEvent`        | Native→Flutter | RTSP events (playing/error/ended/stopped/videoSize/foregrounded) |
 
 ## Build & Run
 
@@ -105,5 +121,8 @@ INTERNET, ACCESS_WIFI_STATE, ACCESS_NETWORK_STATE, ACCESS_FINE_LOCATION, CHANGE_
 - ProGuard keeps rtsp-client-android classes (`com.alexvas.**`) and app classes
 - No automated tests or CI/CD currently configured
 - Test tablet: Samsung SM-T290, device ID `R9WN809CT0J`
+- Test phone: Samsung, device ID `R5CX15DGA2H`
+- Android window/launch backgrounds must be black (not white) for optimal viewing
+- Samsung phones need native `onStop`/`onStart` lifecycle for reliable recovery — Flutter's `WidgetsBindingObserver` is unreliable on Samsung
 - Camera protocol: WebSocket on :2023 → HTTP GET /live_streaming → RTSP on :554/preview
 - Camera IP: 192.168.42.1 (Q2VIEW WiFi network)

@@ -154,6 +154,24 @@ class MainActivity : FlutterActivity() {
         overlaySurfaceView = null
     }
 
+    override fun onStop() {
+        super.onStop()
+        // Activity no longer visible (recents, home, sleep).
+        // Stop the RTSP stream — the SurfaceView surface will be destroyed
+        // and the decoder killed. Stopping explicitly ensures Flutter knows
+        // the stream is dead (prevents stale "playing" state).
+        Log.d(TAG, "onStop: stopping stream")
+        overlayStop()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // Activity becoming visible again — tell Flutter to re-probe.
+        // This is more reliable than Flutter's WidgetsBindingObserver on Samsung.
+        Log.d(TAG, "onStart: notifying Flutter")
+        methodChannel?.invokeMethod("nativeEvent", mapOf("event" to "foregrounded"))
+    }
+
     override fun onDestroy() {
         overlayDispose()
         super.onDestroy()

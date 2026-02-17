@@ -67,7 +67,7 @@ class LiveView extends StatefulWidget {
   State<LiveView> createState() => _LiveViewState();
 }
 
-class _LiveViewState extends State<LiveView> {
+class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
   String _ip = '192.168.42.1';
 
   final List<String> _ipCandidates = const [
@@ -88,6 +88,9 @@ class _LiveViewState extends State<LiveView> {
   int _reconnectAttempt = 0;
   static const int _maxReconnectAttempts = 10;
 
+  // Generation counter — prevents stale async probes from interfering
+  int _probeId = 0;
+
   // Camera command channel (WebSocket on port 2023)
   WebSocket? _cameraWs;
 
@@ -106,12 +109,16 @@ class _LiveViewState extends State<LiveView> {
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
   bool _hasWifi = false;
 
+  // Watchdog: periodic check to recover from any missed reconnect scenario
+  Timer? _watchdogTimer;
+
   // Video aspect ratio — auto-detected from stream
   double _videoAspectRatio = 1.0;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.portraitUp,
@@ -121,8 +128,89 @@ class _LiveViewState extends State<LiveView> {
     ]);
     _nativeChannel.setMethodCallHandler(_onNativeMethodCall);
     _initConnectivityMonitor();
+    _startWatchdog();
     _detectWifiName();
     _probe();
+  }
+
+  // ---- App lifecycle (power save / background recovery) --------------------
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    debugPrint('[HAWKEYE] Lifecycle: $state');
+    if (state == AppLifecycleState.paused) {
+      // App going to background — kill any running probe and stop reconnects.
+      // Increment _probeId so any in-flight async probe exits cleanly.
+      _probeId++;
+      _connecting = false;
+      _reconnectTimer?.cancel();
+      _reconnectAttempt = 0;
+    } else if (state == AppLifecycleState.resumed) {
+      // Delay to let the SurfaceView surface recreate after background
+      Future.delayed(const Duration(seconds: 1), () async {
+        if (!mounted) return;
+
+        // Check if stream is actually still alive via native query
+        if (_nativeSurfaceState == 'playing') {
+          try {
+            final isPlaying = await _nativeChannel.invokeMethod('overlay_isPlaying');
+            if (isPlaying == true) return; // Still genuinely playing
+          } catch (_) {}
+        }
+
+        // Invalidate any stale probe and start fresh
+        debugPrint('[HAWKEYE] App resumed — stream not active, re-probing');
+        _probeId++;
+        _connecting = false;
+        _reconnectTimer?.cancel();
+        _reconnectAttempt = 0;
+        _lastRtspUrl = null;
+        setState(() {
+          _nativeSurfaceState = 'stopped';
+          _isRtspMode = false;
+          _status = 'Resuming...';
+        });
+        _detectWifiName();
+        _probe();
+      });
+    }
+  }
+
+  // ---- Watchdog: safety net for missed reconnect scenarios -----------------
+
+  void _startWatchdog() {
+    _watchdogTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
+      if (!mounted) return;
+
+      // Ask the native side if the stream is genuinely alive —
+      // don't trust _nativeSurfaceState which can be stale after
+      // recents/sleep when the surface is destroyed silently.
+      if (_nativeSurfaceState == 'playing' && _nativeOverlayActive) {
+        try {
+          final alive = await _nativeChannel.invokeMethod('overlay_isPlaying');
+          if (alive == true) return; // Stream is genuinely healthy
+        } catch (_) {}
+
+        // Surface destroyed or decoder dead — state variable is stale
+        debugPrint('[HAWKEYE] Watchdog: stream dead (surface destroyed?), recovering');
+        _probeId++;
+        setState(() {
+          _nativeSurfaceState = 'stopped';
+          _isRtspMode = false;
+          _status = 'Reconnecting...';
+        });
+      }
+
+      // Not playing — try to reconnect
+      if (_connecting) {
+        debugPrint('[HAWKEYE] Watchdog: resetting stuck probe');
+        _probeId++;
+        _connecting = false;
+      }
+
+      _reconnectAttempt = 0;
+      _probe();
+    });
   }
 
   // ---- Native surface event handler (from Kotlin MethodChannel) -----------
@@ -154,6 +242,27 @@ class _LiveViewState extends State<LiveView> {
             setState(() => _videoAspectRatio = w / h);
             debugPrint('[HAWKEYE] Video size: ${w}x$h ratio=${_videoAspectRatio.toStringAsFixed(2)}');
           }
+          break;
+
+        case 'foregrounded':
+          // Sent from native onStart() — activity is visible again after
+          // recents/sleep/home. Stream was stopped in onStop().
+          debugPrint('[HAWKEYE] Foregrounded — will re-probe');
+          Future.delayed(const Duration(seconds: 1), () {
+            if (!mounted) return;
+            // Force fresh probe regardless of current state
+            _probeId++;
+            _connecting = false;
+            _reconnectTimer?.cancel();
+            _reconnectAttempt = 0;
+            _lastRtspUrl = null;
+            setState(() {
+              _nativeSurfaceState = 'stopped';
+              _isRtspMode = false;
+              _status = 'Resuming...';
+            });
+            _probe();
+          });
           break;
 
         case 'error':
@@ -188,7 +297,7 @@ class _LiveViewState extends State<LiveView> {
     }
 
     if (_reconnectAttempt >= _maxReconnectAttempts) {
-      setState(() => _status = 'Reconnect failed after $_maxReconnectAttempts attempts.');
+      setState(() => _status = 'Reconnecting...');
       _reconnectAttempt = 0;
       _lastRtspUrl = null;
       return;
@@ -203,7 +312,7 @@ class _LiveViewState extends State<LiveView> {
     _reconnectAttempt++;
 
     debugPrint('[HAWKEYE] Reconnect attempt $_reconnectAttempt in ${delayMs}ms (fast=$useFastReplay)');
-    setState(() => _status = 'Reconnecting (attempt $_reconnectAttempt)...');
+    setState(() => _status = 'Reconnecting...');
 
     _reconnectTimer = Timer(Duration(milliseconds: delayMs), () {
       if (mounted && !_connecting) {
@@ -310,6 +419,8 @@ class _LiveViewState extends State<LiveView> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _watchdogTimer?.cancel();
     _connectivitySub?.cancel();
     _reconnectTimer?.cancel();
     _nativeChannel.setMethodCallHandler(null);
@@ -326,14 +437,25 @@ class _LiveViewState extends State<LiveView> {
   Future<void> _probe({bool fastReconnect = false}) async {
     if (_connecting) return;
     _connecting = true;
-    debugPrint('[HAWKEYE] _probe() starting, ip=$_ip, fast=$fastReconnect');
+    final myProbeId = _probeId; // Snapshot — if this changes, we've been superseded
+    debugPrint('[HAWKEYE] _probe() #$myProbeId starting, ip=$_ip, fast=$fastReconnect');
+
+    // Dispose old overlay to force a fresh decoder — prevents pixelation
+    // from stale decoder state after reconnect/sleep/WiFi restore
+    if (_nativeOverlayActive) {
+      try {
+        await _nativeChannel.invokeMethod('overlay_stop');
+        await _nativeChannel.invokeMethod('overlay_dispose');
+      } catch (_) {}
+      _nativeOverlayActive = false;
+    }
 
     // Close previous WebSocket if any
     try { await _cameraWs?.close(); } catch (_) {}
     _cameraWs = null;
 
     setState(() {
-      _status = fastReconnect ? 'Reconnecting...' : 'Discovering camera...';
+      _status = 'Connecting...';
       _isRtspMode = false;
     });
 
@@ -365,7 +487,7 @@ class _LiveViewState extends State<LiveView> {
 
       if (foundIp == null) {
         for (final candidateIp in _ipCandidates) {
-          setState(() => _status = 'Scanning $candidateIp ...');
+          setState(() => _status = 'Searching for camera...');
           for (final port in portsToScan) {
             try {
               final socket = await Socket.connect(candidateIp, port,
@@ -375,7 +497,7 @@ class _LiveViewState extends State<LiveView> {
               openPorts.add(port);
               foundIp ??= candidateIp;
             } catch (_) {}
-            if (!mounted) return;
+            if (!mounted || _probeId != myProbeId) return;
           }
           if (openPorts.isNotEmpty) break;
         }
@@ -388,11 +510,11 @@ class _LiveViewState extends State<LiveView> {
 
       setState(() => _ip = foundIp!);
       debugPrint('[HAWKEYE] Camera at $foundIp, ports: $openPorts');
-      setState(() => _status = 'Found camera at $foundIp');
+      setState(() => _status = 'Camera found — connecting...');
 
       // STEP 2: Open WebSocket command channel (activates camera)
       if (openPorts.contains(2023)) {
-        setState(() => _status = 'Connecting to camera...');
+        setState(() => _status = 'Connecting...');
         try {
           _cameraWs = await WebSocket.connect('ws://$foundIp:2023')
               .timeout(const Duration(seconds: 5));
@@ -412,7 +534,7 @@ class _LiveViewState extends State<LiveView> {
       // STEP 3: Activate camera via HTTP API
       String streamPath = '/preview';
       if (openPorts.contains(80)) {
-        setState(() => _status = 'Activating camera...');
+        setState(() => _status = 'Connecting...');
         try {
           final c = HttpClient()..connectionTimeout = const Duration(seconds: 3);
           final rq = await c.getUrl(Uri.parse('http://$foundIp/live_streaming'));
@@ -446,7 +568,7 @@ class _LiveViewState extends State<LiveView> {
       for (final url in rtspUrls) {
         if (!mounted) return;
         debugPrint('[HAWKEYE] Trying: $url');
-        setState(() => _status = 'Connecting: $url');
+        setState(() => _status = 'Connecting...');
         final success = await _playRtspNativeSurface(url);
         if (success) {
           final source = _wifiName ?? 'camera';
@@ -455,9 +577,11 @@ class _LiveViewState extends State<LiveView> {
         }
       }
 
-      setState(() => _status = 'Camera found but stream failed. WS=${_cameraWs != null ? "OK" : "fail"}');
+      setState(() => _status = 'Connection failed — retrying...');
     } finally {
-      _connecting = false;
+      // Only clear _connecting if this probe is still the current one —
+      // a newer probe may have already taken over via lifecycle/watchdog
+      if (_probeId == myProbeId) _connecting = false;
     }
   }
 
@@ -473,7 +597,7 @@ class _LiveViewState extends State<LiveView> {
       await _nativeChannel.invokeMethod('overlay_play', {'url': rtspUrl});
       setState(() {
         _nativeOverlayActive = true;
-        _status = 'Connecting: $rtspUrl';
+        _status = 'Connecting...';
       });
 
       // Wait for VLC event (playing or error) — event handler updates _nativeSurfaceState
@@ -495,7 +619,7 @@ class _LiveViewState extends State<LiveView> {
       debugPrint('[HAWKEYE] Native Surface error: $e');
       setState(() {
         _nativeOverlayActive = false;
-        _status = 'Connection failed: $e';
+        _status = 'Connection failed — retrying...';
       });
       return false;
     }
