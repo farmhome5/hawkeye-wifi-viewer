@@ -1,14 +1,14 @@
 # Hawkeye WiFi Viewer
 
-RTSP video streaming app for WiFi cameras. Flutter UI with native Kotlin VLC integration.
+RTSP video streaming app for WiFi cameras. Flutter UI with native Kotlin MediaCodec integration.
 
 ## Tech Stack
 
 - **Flutter** (Dart) — UI layer, Material 3 dark theme
-- **Kotlin 2.2.0** — native Android bridge for VLC video
-- **VLC (libvlc-all 3.6.3)** — low-latency RTSP playback
+- **Kotlin 2.2.0** — native Android bridge for RTSP video
+- **rtsp-client-android 5.6.3** — direct RTSP→MediaCodec pipeline for low-latency playback
 - **Gradle Kotlin DSL** (Gradle 8.12, AGP 8.7.3)
-- Target SDK 36, Min SDK 21, Java 11
+- Target SDK 36, Min SDK 24, Java 11
 
 ## Project Structure
 
@@ -16,8 +16,9 @@ RTSP video streaming app for WiFi cameras. Flutter UI with native Kotlin VLC int
 lib/                          # Flutter/Dart source (UI + logic)
 android/app/src/main/kotlin/  # Native Kotlin source
   com/hawkeye/wifi/viewer/
-    MainActivity.kt           # Flutter activity + native VLC bridge via MethodChannel
-    NativeVlcHelper.kt        # Shared VLC setup (low-latency config)
+    MainActivity.kt           # Flutter activity + native RTSP bridge via MethodChannel
+    NativeMediaCodecHelper.kt # RTSP→MediaCodec player with aspect ratio handling
+    NativeVlcHelper.kt        # VlcEventCallback interface (shared event contract)
 android/app/build.gradle.kts  # App-level build config
 android/build.gradle.kts      # Project-level build config
 assets/HawkEyewifi.png        # App launcher icon source (256x256)
@@ -30,19 +31,25 @@ Source: `assets/HawkEyewifi.png`. Generated via `flutter_launcher_icons` (config
 
 ## Architecture
 
-Native SurfaceView (MATCH_PARENT) behind transparent Flutter UI (`TransparencyMode.transparent`). Flutter controls VLC via MethodChannel (`hawkeye/native_vlc`). VLC handles aspect ratio scaling and centering internally via `setWindowSize()`. Near-native latency. Supports rotation, auto-reconnect on stream loss, and camera switching.
+RtspSurfaceView (aspect-ratio-sized) behind transparent Flutter UI (`TransparencyMode.transparent`). Flutter controls playback via MethodChannel (`hawkeye/native_vlc`). The rtsp-client-android library feeds RTSP/RTP H.264 NAL units directly into Android's hardware MediaCodec decoder — no intermediate buffering. Latency is ~100-300ms.
 
-`NativeVlcHelper` configures VLC for low-latency streaming (live-caching=0, network-caching=100, RTSP over TCP, hardware decoding).
+`NativeMediaCodecHelper` manages the RtspSurfaceView, handles aspect ratio sizing with margin-based centering, and forwards RTSP status events to Flutter via the `VlcEventCallback` interface. Low-latency SPS rewriting is enabled (`experimentalUpdateSpsFrameWithLowLatencyParams`) to force `maxDecFrameBuffering=1` and `numReorderFrames=0`.
 
 ### Event Flow
 
-VLC events flow: `NativeVlcHelper` → `VlcEventCallback` → `MainActivity` → MethodChannel `nativeEvent` → Flutter `_onNativeMethodCall`. Events: `playing`, `error`, `ended`, `stopped`, `videoSize`.
+RTSP events flow: `RtspStatusListener` → `NativeMediaCodecHelper` → `VlcEventCallback` → `MainActivity` → MethodChannel `nativeEvent` → Flutter `_onNativeMethodCall`. Events: `playing`, `error`, `ended`, `stopped`, `videoSize`.
 
-Auto-reconnect uses exponential backoff (300ms–5s, max 10 attempts). On stream loss, the overlay is kept alive and `_probe(fastReconnect: true)` skips port scanning.
+Auto-reconnect uses a two-tier strategy: fast replay (first 6 attempts at 500ms intervals, just retries the same RTSP URL) then falls back to full probe with exponential backoff (300ms–5s). Max 10 total attempts.
+
+### Aspect Ratio Handling
+
+RtspSurfaceView does NOT handle aspect ratio internally — it stretches to fill its view bounds. `NativeMediaCodecHelper.updateViewAspectRatio()` calculates correct view dimensions from the video's aspect ratio and parent container size, then applies FrameLayout.LayoutParams with margins to center the view. This is called on `onRtspFrameSizeChanged` and on parent layout changes (rotation).
+
+Do NOT use Gravity.CENTER — FlutterView's layout system does not reliably honor FrameLayout gravity on child views during config changes. Use margin-based centering instead.
 
 ### Rotation Handling
 
-SurfaceView stays MATCH_PARENT — never resized via LayoutParams. On rotation, `surfaceChanged()` calls `vlcHelper.updateWindowSize(w, h)` which tells VLC the new surface dimensions. VLC re-scales and re-centers the video internally. Do NOT attempt to resize/center the SurfaceView via Gravity or margins — FlutterView's layout system does not reliably honor FrameLayout gravity on child views during config changes.
+An `OnLayoutChangeListener` on the parent container detects dimension changes on rotation and calls `updateViewAspectRatio()` to recalculate the SurfaceView size and margins.
 
 ## MethodChannel API
 
@@ -50,13 +57,13 @@ Channel: `hawkeye/native_vlc`
 
 | Method               | Direction     | Purpose                        |
 |----------------------|---------------|--------------------------------|
-| `overlay_init`       | Flutter→Native | Initialize overlay VLC surface |
+| `overlay_init`       | Flutter→Native | Initialize overlay RTSP surface |
 | `overlay_play`       | Flutter→Native | Start RTSP stream (pass URL)   |
 | `overlay_stop`       | Flutter→Native | Stop playback                  |
-| `overlay_dispose`    | Flutter→Native | Release VLC resources          |
+| `overlay_dispose`    | Flutter→Native | Release resources              |
 | `overlay_isPlaying`  | Flutter→Native | Query playback state           |
 | `overlay_getVideoSize` | Flutter→Native | Get current video dimensions  |
-| `nativeEvent`        | Native→Flutter | VLC events (playing/error/ended/stopped/videoSize) |
+| `nativeEvent`        | Native→Flutter | RTSP events (playing/error/ended/stopped/videoSize) |
 
 ## Build & Run
 
@@ -75,7 +82,7 @@ cd android && ./gradlew assembleDebug
 
 - Native Kotlin follows standard Android conventions (PascalCase classes, camelCase functions)
 - Flutter/Dart follows standard Dart conventions (snake_case files, camelCase variables, PascalCase classes)
-- VLC configuration changes go in `NativeVlcHelper.kt` — both approaches share it
+- RTSP/MediaCodec configuration changes go in `NativeMediaCodecHelper.kt`
 - Cleartext HTTP traffic is allowed (required for local camera streams)
 - Impeller is disabled; Skia renderer is used for stable compositing with native SurfaceView
 
@@ -86,21 +93,16 @@ cd android && ./gradlew assembleDebug
 - `permission_handler` — runtime permissions
 
 **Android (build.gradle.kts):**
-- `org.videolan.android:libvlc-all:3.6.3` — native VLC
+- `com.github.alexeyvasilyev:rtsp-client-android:5.6.3` — direct RTSP→MediaCodec (via JitPack)
 
 ## Permissions
 
 INTERNET, ACCESS_WIFI_STATE, ACCESS_NETWORK_STATE, ACCESS_FINE_LOCATION, CHANGE_WIFI_MULTICAST_STATE
 
-## Known Issues
-
-- Latency is not yet as fast as VS Borescope — there's still a small gap, possibly from VLC config tuning or RTSP session negotiation overhead.
-- Camera switching delay is ~4-7 seconds due to full probe cycle (WebSocket + HTTP API + RTSP connection). Fast reconnect path helps for stream recovery but camera switching still requires re-probing.
-
 ## Known Considerations
 
-- ProGuard keeps VLC classes (`org.videolan.**`) and app classes for JNI safety
-- Gradle JVM args are set high (8G heap) — needed for VLC native compilation
+- ProGuard keeps rtsp-client-android classes (`com.alexvas.**`) and app classes
 - No automated tests or CI/CD currently configured
-- `IVLCVout.OnNewVideoLayoutListener` MUST call `vlcVout.setWindowSize()` or VLC aborts playback immediately
 - Test tablet: Samsung SM-T290, device ID `R9WN809CT0J`
+- Camera protocol: WebSocket on :2023 → HTTP GET /live_streaming → RTSP on :554/preview
+- Camera IP: 192.168.42.1 (Q2VIEW WiFi network)

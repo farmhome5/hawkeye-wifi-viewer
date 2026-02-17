@@ -90,6 +90,9 @@ class _LiveViewState extends State<LiveView> {
   // Camera command channel (WebSocket on port 2023)
   WebSocket? _cameraWs;
 
+  // Last successful RTSP URL — used for fast replay on stream loss
+  String? _lastRtspUrl;
+
   // UI/state
   bool _connecting = false;
   bool _isRtspMode = false;
@@ -150,10 +153,13 @@ class _LiveViewState extends State<LiveView> {
         case 'error':
         case 'ended':
         case 'stopped':
-          if (_nativeSurfaceState == 'playing' && mounted) {
+          final wasPlaying = _nativeSurfaceState == 'playing';
+          if (mounted) {
+            setState(() => _nativeSurfaceState = event);
+          }
+          if (wasPlaying && mounted) {
             debugPrint('[HAWKEYE] Stream lost ($event) — will reconnect');
             setState(() {
-              _nativeSurfaceState = event;
               _isRtspMode = false;
               _status = 'Stream lost — reconnecting...';
             });
@@ -169,22 +175,62 @@ class _LiveViewState extends State<LiveView> {
     if (_reconnectAttempt >= _maxReconnectAttempts) {
       setState(() => _status = 'Reconnect failed after $_maxReconnectAttempts attempts.');
       _reconnectAttempt = 0;
+      _lastRtspUrl = null;
       return;
     }
 
-    // Exponential backoff: 300ms, 600ms, 1.2s, 2.4s... capped at 5s
-    final delayMs = (300 * (1 << _reconnectAttempt)).clamp(300, 5000);
+    // Fast replay: retry same URL without re-probing (first 6 attempts, 500ms interval)
+    // Then fall back to full probe with exponential backoff
+    final useFastReplay = _lastRtspUrl != null && _reconnectAttempt < 6;
+    final delayMs = useFastReplay
+        ? 500
+        : (300 * (1 << (_reconnectAttempt - 6).clamp(0, 4))).clamp(300, 5000);
     _reconnectAttempt++;
 
-    debugPrint('[HAWKEYE] Reconnect attempt $_reconnectAttempt in ${delayMs}ms');
+    debugPrint('[HAWKEYE] Reconnect attempt $_reconnectAttempt in ${delayMs}ms (fast=$useFastReplay)');
     setState(() => _status = 'Reconnecting (attempt $_reconnectAttempt)...');
 
     _reconnectTimer = Timer(Duration(milliseconds: delayMs), () {
       if (mounted && !_connecting) {
-        _nativeChannel.invokeMethod('overlay_stop').catchError((_) {});
-        _probe(fastReconnect: true);
+        if (useFastReplay) {
+          _fastReplay();
+        } else {
+          _nativeChannel.invokeMethod('overlay_stop').catchError((_) {});
+          _probe(fastReconnect: true);
+        }
       }
     });
+  }
+
+  /// Quickly retry the last RTSP URL without re-probing the camera.
+  Future<void> _fastReplay() async {
+    if (_connecting || _lastRtspUrl == null) {
+      _probe(fastReconnect: true);
+      return;
+    }
+    _connecting = true;
+
+    try {
+      debugPrint('[HAWKEYE] Fast replay: $_lastRtspUrl');
+      setState(() => _status = 'Reconnecting...');
+      await _nativeChannel.invokeMethod('overlay_stop').catchError((_) {});
+      await _nativeChannel.invokeMethod('overlay_play', {'url': _lastRtspUrl});
+      setState(() => _nativeSurfaceState = 'connecting');
+
+      // Wait up to 4 seconds for playing state
+      for (int i = 0; i < 8; i++) {
+        await Future.delayed(const Duration(milliseconds: 500));
+        if (!mounted) return;
+        if (_nativeSurfaceState == 'playing') return; // Success!
+        if (_nativeSurfaceState == 'error') break; // Fail fast
+      }
+
+      // Failed — schedule next attempt
+      debugPrint('[HAWKEYE] Fast replay failed, scheduling next attempt');
+      _scheduleNativeReconnect();
+    } finally {
+      _connecting = false;
+    }
   }
 
   Future<void> _detectWifiName() async {
@@ -376,7 +422,10 @@ class _LiveViewState extends State<LiveView> {
       for (int i = 0; i < 20; i++) { // 10 seconds max
         await Future.delayed(const Duration(milliseconds: 500));
         if (!mounted) return false;
-        if (_nativeSurfaceState == 'playing') return true;
+        if (_nativeSurfaceState == 'playing') {
+          _lastRtspUrl = rtspUrl;
+          return true;
+        }
         if (_nativeSurfaceState == 'error') break;
       }
 

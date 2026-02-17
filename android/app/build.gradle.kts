@@ -25,7 +25,7 @@ android {
         applicationId = "com.hawkeye.wifi.viewer"
 
         // Ensure these are explicit & compatible
-        minSdk = 21
+        minSdk = 24
         targetSdk = 36
 
         versionCode = flutter.versionCode
@@ -36,7 +36,6 @@ android {
         release {
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
-            // Keep VLC JNI classes from being stripped by R8
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -48,7 +47,7 @@ android {
 }
 
 dependencies {
-    implementation("org.videolan.android:libvlc-all:3.6.3")
+    implementation("com.github.alexeyvasilyev:rtsp-client-android:5.6.3")
 }
 
 flutter {

@@ -1,6 +1,6 @@
-# Keep all VLC classes — JNI native code references these by name
--keep class org.videolan.** { *; }
--dontwarn org.videolan.**
+# Keep rtsp-client-android classes (used via reflection/JNI)
+-keep class com.alexvas.** { *; }
+-dontwarn com.alexvas.**
 
 # Keep native video classes (used via MethodChannel)
--keep class com.hawkeye.wifi.viewer.NativeVlcHelper { *; }
+-keep class com.hawkeye.wifi.viewer.NativeMediaCodecHelper { *; }
