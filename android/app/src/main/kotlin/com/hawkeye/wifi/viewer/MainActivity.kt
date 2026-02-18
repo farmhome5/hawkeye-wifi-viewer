@@ -19,6 +19,7 @@ class MainActivity : FlutterActivity() {
     private var methodChannel: MethodChannel? = null
     private var overlaySurfaceView: RtspSurfaceView? = null
     private var mediaHelper: NativeMediaCodecHelper? = null
+    private var captureHelper: CaptureHelper? = null
     private var videoWidth: Int = 0
     private var videoHeight: Int = 0
 
@@ -53,7 +54,77 @@ class MainActivity : FlutterActivity() {
                 "overlay_getVideoSize" -> {
                     result.success(mapOf("width" to videoWidth, "height" to videoHeight))
                 }
+                "capture_photo" -> {
+                    val wifiName = call.argument<String>("wifiName") ?: "Camera"
+                    val sv = overlaySurfaceView
+                    if (sv == null) {
+                        result.error("NO_SURFACE", "Surface not available", null)
+                    } else {
+                        ensureCaptureHelper()
+                        captureHelper?.capturePhoto(sv, wifiName)
+                        result.success(true)
+                    }
+                }
+                "start_recording" -> {
+                    val url = call.argument<String>("url") ?: ""
+                    val wifiName = call.argument<String>("wifiName") ?: "Camera"
+                    val width = call.argument<Int>("width") ?: 400
+                    val height = call.argument<Int>("height") ?: 400
+                    if (url.isEmpty()) {
+                        result.error("NO_URL", "RTSP URL required", null)
+                    } else {
+                        ensureCaptureHelper()
+                        captureHelper?.startRecording(url, wifiName, width, height)
+                        result.success(true)
+                    }
+                }
+                "stop_recording" -> {
+                    captureHelper?.stopRecording()
+                    result.success(true)
+                }
+                "is_recording" -> {
+                    result.success(captureHelper?.isRecording == true)
+                }
                 else -> result.notImplemented()
+            }
+        }
+    }
+
+    // --- Capture helper: photo + video recording ---
+
+    private fun ensureCaptureHelper() {
+        if (captureHelper == null) {
+            captureHelper = CaptureHelper(applicationContext)
+        }
+        captureHelper?.callback = captureCallback
+    }
+
+    private val captureCallback = object : CaptureCallback {
+        override fun onPhotoSaved(path: String) {
+            runOnUiThread {
+                methodChannel?.invokeMethod("nativeEvent", mapOf(
+                    "event" to "photo_saved",
+                    "path" to path
+                ))
+            }
+        }
+
+        override fun onRecordingStopped(path: String, durationMs: Long) {
+            runOnUiThread {
+                methodChannel?.invokeMethod("nativeEvent", mapOf(
+                    "event" to "recording_stopped",
+                    "path" to path,
+                    "durationMs" to durationMs
+                ))
+            }
+        }
+
+        override fun onCaptureError(message: String) {
+            runOnUiThread {
+                methodChannel?.invokeMethod("nativeEvent", mapOf(
+                    "event" to "capture_error",
+                    "message" to message
+                ))
             }
         }
     }
@@ -173,6 +244,8 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        captureHelper?.release()
+        captureHelper = null
         overlayDispose()
         super.onDestroy()
     }

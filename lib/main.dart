@@ -112,8 +112,19 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
   // Watchdog: periodic check to recover from any missed reconnect scenario
   Timer? _watchdogTimer;
 
+  // Location permission — only request once per app session
+  bool _locationPermissionRequested = false;
+
   // Video aspect ratio — auto-detected from stream
   double _videoAspectRatio = 1.0;
+  int _videoWidth = 0;
+  int _videoHeight = 0;
+
+  // Capture state
+  bool _isRecording = false;
+  Duration _recordingDuration = Duration.zero;
+  Timer? _recordingTimer;
+  bool _photoFlash = false; // brief visual feedback on photo capture
 
   @override
   void initState() {
@@ -239,7 +250,11 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
           final w = args['width'] as int;
           final h = args['height'] as int;
           if (w > 0 && h > 0 && mounted) {
-            setState(() => _videoAspectRatio = w / h);
+            setState(() {
+              _videoAspectRatio = w / h;
+              _videoWidth = w;
+              _videoHeight = h;
+            });
             debugPrint('[HAWKEYE] Video size: ${w}x$h ratio=${_videoAspectRatio.toStringAsFixed(2)}');
           }
           break;
@@ -265,6 +280,38 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
           });
           break;
 
+        case 'photo_saved':
+          debugPrint('[HAWKEYE] Photo saved: ${args['path']}');
+          if (mounted) {
+            setState(() => _photoFlash = true);
+            Future.delayed(const Duration(milliseconds: 300), () {
+              if (mounted) setState(() => _photoFlash = false);
+            });
+          }
+          break;
+
+        case 'recording_stopped':
+          debugPrint('[HAWKEYE] Recording stopped: ${args['path']} (${args['durationMs']}ms)');
+          _recordingTimer?.cancel();
+          if (mounted) {
+            setState(() {
+              _isRecording = false;
+              _recordingDuration = Duration.zero;
+            });
+          }
+          break;
+
+        case 'capture_error':
+          debugPrint('[HAWKEYE] Capture error: ${args['message']}');
+          _recordingTimer?.cancel();
+          if (mounted) {
+            setState(() {
+              _isRecording = false;
+              _recordingDuration = Duration.zero;
+            });
+          }
+          break;
+
         case 'error':
         case 'ended':
         case 'stopped':
@@ -274,6 +321,15 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
           }
           if (wasPlaying && mounted) {
             debugPrint('[HAWKEYE] Stream lost ($event) — will reconnect');
+            // Stop recording if stream is lost
+            if (_isRecording) {
+              _nativeChannel.invokeMethod('stop_recording').catchError((_) {});
+              _recordingTimer?.cancel();
+              setState(() {
+                _isRecording = false;
+                _recordingDuration = Duration.zero;
+              });
+            }
             setState(() {
               _isRtspMode = false;
               _status = 'Stream lost — reconnecting...';
@@ -359,16 +415,27 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
 
   Future<void> _detectWifiName() async {
     try {
-      final status = await Permission.location.request();
+      // Check if location permission is already granted — only request once
+      var status = await Permission.location.status;
+      if (!status.isGranted && !_locationPermissionRequested) {
+        _locationPermissionRequested = true;
+        status = await Permission.location.request();
+      }
       if (status.isGranted) {
         final info = NetworkInfo();
         final name = await info.getWifiName();
         if (name != null && mounted) {
-          setState(() => _wifiName = name.replaceAll('"', ''));
+          setState(() {
+            _wifiName = name.replaceAll('"', '');
+            // Update status text if already streaming
+            if (_nativeSurfaceState == 'playing') {
+              _status = 'Streaming from $_wifiName';
+            }
+          });
           debugPrint('[HAWKEYE] WiFi SSID: $_wifiName');
         }
       } else {
-        debugPrint('[HAWKEYE] Location permission denied — cannot get WiFi name');
+        debugPrint('[HAWKEYE] Location permission not granted — cannot get WiFi name');
       }
     } catch (e) {
       debugPrint('[HAWKEYE] WiFi name detection failed: $e');
@@ -423,7 +490,11 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
     _watchdogTimer?.cancel();
     _connectivitySub?.cancel();
     _reconnectTimer?.cancel();
+    _recordingTimer?.cancel();
     _nativeChannel.setMethodCallHandler(null);
+    if (_isRecording) {
+      _nativeChannel.invokeMethod('stop_recording').catchError((_) {});
+    }
     if (_nativeOverlayActive) {
       _nativeChannel.invokeMethod('overlay_stop').catchError((_) {});
       _nativeChannel.invokeMethod('overlay_dispose').catchError((_) {});
@@ -625,10 +696,83 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
     }
   }
 
+  // ---- Capture: photo + video recording -----------------------------------
+
+  Future<void> _requestStoragePermissions() async {
+    // API 33+ needs READ_MEDIA_IMAGES/VIDEO; API < 29 needs WRITE_EXTERNAL_STORAGE
+    // permission_handler maps these automatically based on API level
+    final statuses = await [
+      Permission.photos,
+      Permission.videos,
+      Permission.storage,
+    ].request();
+    debugPrint('[HAWKEYE] Storage permissions: $statuses');
+  }
+
+  Future<void> _capturePhoto() async {
+    if (!_isRtspMode || _lastRtspUrl == null) return;
+    await _requestStoragePermissions();
+    final wifiName = _wifiName ?? 'Camera';
+    try {
+      await _nativeChannel.invokeMethod('capture_photo', {'wifiName': wifiName});
+      debugPrint('[HAWKEYE] Photo capture requested');
+    } catch (e) {
+      debugPrint('[HAWKEYE] Photo capture error: $e');
+    }
+  }
+
+  Future<void> _toggleRecording() async {
+    if (_isRecording) {
+      // Stop recording
+      try {
+        await _nativeChannel.invokeMethod('stop_recording');
+        debugPrint('[HAWKEYE] Stop recording requested');
+      } catch (e) {
+        debugPrint('[HAWKEYE] Stop recording error: $e');
+      }
+    } else {
+      // Start recording
+      if (!_isRtspMode || _lastRtspUrl == null) return;
+      await _requestStoragePermissions();
+      final wifiName = _wifiName ?? 'Camera';
+      try {
+        await _nativeChannel.invokeMethod('start_recording', {
+          'url': _lastRtspUrl,
+          'wifiName': wifiName,
+          'width': _videoWidth > 0 ? _videoWidth : 400,
+          'height': _videoHeight > 0 ? _videoHeight : 400,
+        });
+        setState(() {
+          _isRecording = true;
+          _recordingDuration = Duration.zero;
+        });
+        _recordingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+          if (mounted) {
+            setState(() => _recordingDuration += const Duration(seconds: 1));
+          }
+        });
+        debugPrint('[HAWKEYE] Start recording requested: $_lastRtspUrl');
+      } catch (e) {
+        debugPrint('[HAWKEYE] Start recording error: $e');
+      }
+    }
+  }
+
+  String _formatDuration(Duration d) {
+    final minutes = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final seconds = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    if (d.inHours > 0) {
+      return '${d.inHours}:$minutes:$seconds';
+    }
+    return '$minutes:$seconds';
+  }
+
   // ---- UI ----------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
+    final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
+
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: Stack(
@@ -640,13 +784,19 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
               color: const Color(0xFE000000),
               child: const Center(child: CircularProgressIndicator()),
             ),
-          // Status overlay at bottom
+          // Photo flash feedback
+          if (_photoFlash)
+            Container(color: const Color(0xBBFFFFFF)),
+          // Capture bar at bottom (visible when streaming, status-only when not)
           Positioned(
             left: 0,
             right: 0,
             bottom: 0,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              padding: EdgeInsets.symmetric(
+                horizontal: isLandscape ? 20 : 12,
+                vertical: 8,
+              ),
               decoration: const BoxDecoration(
                 gradient: LinearGradient(
                   begin: Alignment.bottomCenter,
@@ -654,20 +804,86 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
                   colors: [Color(0xCC000000), Color(0x00000000)],
                 ),
               ),
-              child: Text(
-                _status,
-                style: const TextStyle(
-                  color: Colors.white70,
-                  fontSize: 13,
-                ),
-                textAlign: TextAlign.center,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
+              child: SafeArea(
+                top: false,
+                child: _isRtspMode
+                    ? _buildCaptureBar(isLandscape)
+                    : _buildStatusOnly(),
               ),
             ),
           ),
         ],
       ),
     );
+  }
+
+  Widget _buildStatusOnly() {
+    return Text(
+      _status,
+      style: const TextStyle(color: Colors.white70, fontSize: 13),
+      textAlign: TextAlign.center,
+      maxLines: 2,
+      overflow: TextOverflow.ellipsis,
+    );
+  }
+
+  Widget _buildCaptureBar(bool isLandscape) {
+    final statusText = Text(
+      _isRecording
+          ? 'REC ${_formatDuration(_recordingDuration)}'
+          : _status,
+      style: TextStyle(
+        color: _isRecording ? const Color(0xFFFF4444) : Colors.white70,
+        fontSize: 13,
+        fontWeight: _isRecording ? FontWeight.bold : FontWeight.normal,
+      ),
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+    );
+
+    final buttons = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Photo button
+        IconButton(
+          onPressed: _capturePhoto,
+          icon: const Icon(Icons.camera_alt, color: Colors.white, size: 28),
+          tooltip: 'Take photo',
+          padding: const EdgeInsets.all(8),
+          constraints: const BoxConstraints(),
+        ),
+        const SizedBox(width: 16),
+        // Record button
+        IconButton(
+          onPressed: _toggleRecording,
+          icon: Icon(
+            _isRecording ? Icons.stop_circle : Icons.fiber_manual_record,
+            color: _isRecording ? const Color(0xFFFF4444) : Colors.white,
+            size: 32,
+          ),
+          tooltip: _isRecording ? 'Stop recording' : 'Start recording',
+          padding: const EdgeInsets.all(8),
+          constraints: const BoxConstraints(),
+        ),
+      ],
+    );
+
+    if (isLandscape) {
+      return Row(
+        children: [
+          Expanded(child: statusText),
+          buttons,
+        ],
+      );
+    } else {
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          statusText,
+          const SizedBox(height: 4),
+          buttons,
+        ],
+      );
+    }
   }
 }

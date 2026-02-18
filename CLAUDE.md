@@ -19,6 +19,7 @@ android/app/src/main/kotlin/  # Native Kotlin source
     MainActivity.kt           # Flutter activity + native RTSP bridge via MethodChannel
     NativeMediaCodecHelper.kt # RTSP→MediaCodec player with aspect ratio handling
     NativeVlcHelper.kt        # VlcEventCallback interface (shared event contract)
+    CaptureHelper.kt          # Photo capture (PixelCopy) + video recording (transcode pipeline)
 android/app/build.gradle.kts  # App-level build config
 android/build.gradle.kts      # Project-level build config
 assets/HawkEyewifi.png        # App launcher icon source (256x256)
@@ -67,6 +68,39 @@ Do NOT use Gravity.CENTER — FlutterView's layout system does not reliably hono
 
 An `OnLayoutChangeListener` on the parent container detects dimension changes on rotation and calls `updateViewAspectRatio()` to recalculate the SurfaceView size and margins.
 
+### Capture: Photos & Video Clips
+
+`CaptureHelper.kt` handles both photo capture and video recording:
+
+- **Photos**: `PixelCopy.request()` on the SurfaceView → JPEG saved to `DCIM/{wifiName}/` via MediaStore (API 29+) or direct file + MediaScanner (API 24-28)
+- **Video**: Opens a parallel `RtspClient` to the same RTSP URL, decodes NALs through MediaCodec, re-encodes via hardware encoder (producing proper IDR frames), and muxes to MP4 via `MediaMuxer`. Saved to `DCIM/{wifiName}/`
+- Video recording uses a separate RTSP connection so recording doesn't affect live view latency
+- Wall clock timestamps (`System.nanoTime()`) used for PTS — library `timestamp` parameter produces wrong durations
+
+#### Video Transcode Pipeline
+
+Camera sends all H.264 frames as **non-IDR (NAL type 1)**, never type 5 (IDR). MP4 players can't decode from a cold start without IDR frames. Direct muxing of these NALs produces unplayable (green) video regardless of KEY_FRAME flags.
+
+**Solution**: Full MediaCodec transcode: RTSP NALs → decoder → (Surface) → encoder → muxer. The encoder produces proper IDR frames.
+
+Critical requirements for the decoder to work with non-IDR NALs:
+1. **Low-latency decoder options**: `low-latency=1`, `KEY_OPERATING_RATE=Short.MAX_VALUE`, `KEY_PRIORITY=0`
+2. **Qualcomm vendor extensions**: `vendor.qti-ext-dec-picture-order.enable=1`, `vendor.qti-ext-dec-low-latency.enable=1` (set via `setParameters()` after `configure()`)
+3. **Raw NAL data passthrough**: Feed data exactly as received from rtsp-client-android (with original start codes) — do NOT strip/re-add start codes
+
+These are the same low-latency parameters that the rtsp-client-android library uses internally for its live view decoder (via `MediaCodecHelper.setDecoderLowLatencyOptions()`).
+
+The decoder outputs to the encoder's input Surface. The encoder is configured with `COLOR_FormatSurface`, 4Mbps, IDR every 1 second.
+
+### Capture Bar UI
+
+Bottom bar replaces the old floating status text. Adaptive layout:
+- **Landscape**: `Row` — status text left, photo + record buttons right
+- **Portrait**: `Column` — status text top, buttons below
+- Visible when streaming; falls back to status-only text when connecting/loading
+- Record button turns red with elapsed timer during recording
+- Photo capture shows brief white flash overlay as feedback
+
 ## MethodChannel API
 
 Channel: `hawkeye/native_vlc`
@@ -79,7 +113,11 @@ Channel: `hawkeye/native_vlc`
 | `overlay_dispose`    | Flutter→Native | Release resources              |
 | `overlay_isPlaying`  | Flutter→Native | Query playback state           |
 | `overlay_getVideoSize` | Flutter→Native | Get current video dimensions  |
-| `nativeEvent`        | Native→Flutter | RTSP events (playing/error/ended/stopped/videoSize/foregrounded) |
+| `capture_photo`      | Flutter→Native | Take still photo (PixelCopy)   |
+| `start_recording`    | Flutter→Native | Start video recording          |
+| `stop_recording`     | Flutter→Native | Stop video recording           |
+| `is_recording`       | Flutter→Native | Query recording state          |
+| `nativeEvent`        | Native→Flutter | Events: playing/error/ended/stopped/videoSize/foregrounded/photo_saved/recording_stopped/capture_error |
 
 ## Build & Run
 
@@ -114,7 +152,7 @@ cd android && ./gradlew assembleDebug
 
 ## Permissions
 
-INTERNET, ACCESS_WIFI_STATE, ACCESS_NETWORK_STATE, ACCESS_FINE_LOCATION, CHANGE_WIFI_MULTICAST_STATE
+INTERNET, ACCESS_WIFI_STATE, ACCESS_NETWORK_STATE, ACCESS_FINE_LOCATION, CHANGE_WIFI_MULTICAST_STATE, WRITE_EXTERNAL_STORAGE (API < 29), READ_MEDIA_IMAGES (API 33+), READ_MEDIA_VIDEO (API 33+)
 
 ## Known Considerations
 

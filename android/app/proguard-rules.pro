@@ -4,3 +4,4 @@
 
 # Keep native video classes (used via MethodChannel)
 -keep class com.hawkeye.wifi.viewer.NativeMediaCodecHelper { *; }
+-keep class com.hawkeye.wifi.viewer.CaptureHelper { *; }
