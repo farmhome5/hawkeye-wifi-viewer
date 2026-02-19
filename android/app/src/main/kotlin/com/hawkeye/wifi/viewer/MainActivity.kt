@@ -70,11 +70,14 @@ class MainActivity : FlutterActivity() {
                     val wifiName = call.argument<String>("wifiName") ?: "Camera"
                     val width = call.argument<Int>("width") ?: 400
                     val height = call.argument<Int>("height") ?: 400
+                    val sv = overlaySurfaceView
                     if (url.isEmpty()) {
                         result.error("NO_URL", "RTSP URL required", null)
+                    } else if (sv == null) {
+                        result.error("NO_SURFACE", "Surface not available", null)
                     } else {
                         ensureCaptureHelper()
-                        captureHelper?.startRecording(url, wifiName, width, height)
+                        captureHelper?.startRecording(sv, url, wifiName, width, height)
                         result.success(true)
                     }
                 }
@@ -213,6 +216,10 @@ class MainActivity : FlutterActivity() {
 
     private fun overlayDispose() {
         Log.d(TAG, "overlay dispose")
+        // Stop recording if active — surfaceView is about to be destroyed
+        if (captureHelper?.isRecording == true) {
+            captureHelper?.stopRecording()
+        }
         videoWidth = 0
         videoHeight = 0
         mediaHelper?.eventCallback = null
@@ -227,6 +234,10 @@ class MainActivity : FlutterActivity() {
 
     override fun onStop() {
         super.onStop()
+        // Stop recording if active — surface will be destroyed
+        if (captureHelper?.isRecording == true) {
+            captureHelper?.stopRecording()
+        }
         // Activity no longer visible (recents, home, sleep).
         // Stop the RTSP stream — the SurfaceView surface will be destroyed
         // and the decoder killed. Stopping explicitly ensures Flutter knows

@@ -19,7 +19,7 @@ android/app/src/main/kotlin/  # Native Kotlin source
     MainActivity.kt           # Flutter activity + native RTSP bridge via MethodChannel
     NativeMediaCodecHelper.kt # RTSP→MediaCodec player with aspect ratio handling
     NativeVlcHelper.kt        # VlcEventCallback interface (shared event contract)
-    CaptureHelper.kt          # Photo capture (PixelCopy) + video recording (transcode pipeline)
+    CaptureHelper.kt          # Photo capture (PixelCopy) + video recording (direct mux)
 android/app/build.gradle.kts  # App-level build config
 android/build.gradle.kts      # Project-level build config
 assets/HawkEyewifi.png        # App launcher icon source (256x256)
@@ -73,24 +73,16 @@ An `OnLayoutChangeListener` on the parent container detects dimension changes on
 `CaptureHelper.kt` handles both photo capture and video recording:
 
 - **Photos**: `PixelCopy.request()` on the SurfaceView → JPEG saved to `DCIM/{wifiName}/` via MediaStore (API 29+) or direct file + MediaScanner (API 24-28)
-- **Video**: Opens a parallel `RtspClient` to the same RTSP URL, decodes NALs through MediaCodec, re-encodes via hardware encoder (producing proper IDR frames), and muxes to MP4 via `MediaMuxer`. Saved to `DCIM/{wifiName}/`
-- Video recording uses a separate RTSP connection so recording doesn't affect live view latency
-- Wall clock timestamps (`System.nanoTime()`) used for PTS — library `timestamp` parameter produces wrong durations
+- **Video**: Taps into the live view's NAL stream via `RtspSurfaceView.setDataListener()`, rewrites NAL type 1→5 (IDR), converts Annex B→AVCC format, and muxes directly to MP4 via `MediaMuxer`. Saved to `DCIM/{wifiName}/`
+- SPS/PPS are fetched via a lightweight RTSP DESCRIBE request (single TCP exchange, no SETUP/PLAY)
+- NALs flow through an `ArrayBlockingQueue` to decouple the RTSP thread from the muxing thread
+- Recording automatically stops on `onStop()` or `overlay_dispose` (stream destruction)
 
-#### Video Transcode Pipeline
+#### Direct Mux Approach
 
-Camera sends all H.264 frames as **non-IDR (NAL type 1)**, never type 5 (IDR). MP4 players can't decode from a cold start without IDR frames. Direct muxing of these NALs produces unplayable (green) video regardless of KEY_FRAME flags.
+Camera sends all H.264 frames as **non-IDR (NAL type 1)** but they are all-intra (independently decodable). The direct mux approach rewrites NAL type 1→5 and sets `BUFFER_FLAG_KEY_FRAME` so MP4 players treat every frame as a sync sample.
 
-**Solution**: Full MediaCodec transcode: RTSP NALs → decoder → (Surface) → encoder → muxer. The encoder produces proper IDR frames.
-
-Critical requirements for the decoder to work with non-IDR NALs:
-1. **Low-latency decoder options**: `low-latency=1`, `KEY_OPERATING_RATE=Short.MAX_VALUE`, `KEY_PRIORITY=0`
-2. **Qualcomm vendor extensions**: `vendor.qti-ext-dec-picture-order.enable=1`, `vendor.qti-ext-dec-low-latency.enable=1` (set via `setParameters()` after `configure()`)
-3. **Raw NAL data passthrough**: Feed data exactly as received from rtsp-client-android (with original start codes) — do NOT strip/re-add start codes
-
-These are the same low-latency parameters that the rtsp-client-android library uses internally for its live view decoder (via `MediaCodecHelper.setDecoderLowLatencyOptions()`).
-
-The decoder outputs to the encoder's input Surface. The encoder is configured with `COLOR_FormatSurface`, 4Mbps, IDR every 1 second.
+A transcode pipeline (decoder→encoder) was tried first but doesn't work on resource-limited devices — the tablet's Snapdragon 429 can't allocate a second hardware decoder (error 0x80001001), and the software decoder can't produce output from non-IDR frames.
 
 ### Capture Bar UI
 

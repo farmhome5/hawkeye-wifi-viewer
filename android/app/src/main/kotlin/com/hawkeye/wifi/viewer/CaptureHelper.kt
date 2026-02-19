@@ -4,7 +4,6 @@ import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.media.MediaCodec
-import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.media.MediaScannerConnection
@@ -14,15 +13,21 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.util.Base64
 import android.util.Log
 import android.view.PixelCopy
-import android.view.Surface
 import android.view.SurfaceView
-import com.alexvas.rtsp.RtspClient
-import com.alexvas.utils.NetUtils
+import com.alexvas.rtsp.widget.RtspDataListener
+import com.alexvas.rtsp.widget.RtspSurfaceView
+import java.io.BufferedReader
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStreamReader
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.nio.ByteBuffer
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 interface CaptureCallback {
@@ -35,9 +40,7 @@ class CaptureHelper(private val context: Context) {
 
     companion object {
         private const val TAG = "CaptureHelper"
-        private const val ENCODER_BITRATE = 4_000_000 // 4 Mbps
-        private const val ENCODER_FRAME_RATE = 10
-        private const val ENCODER_IDR_INTERVAL = 1 // IDR every 1 second
+        private const val NAL_QUEUE_CAPACITY = 60 // ~6 seconds at 10fps
     }
 
     var callback: CaptureCallback? = null
@@ -52,14 +55,15 @@ class CaptureHelper(private val context: Context) {
     private var startNanos = 0L
     private var frameCount = 0
 
-    // Transcode pipeline: RTSP NALs → decoder → (Surface) → encoder → muxer
-    private var decoder: MediaCodec? = null
-    private var encoder: MediaCodec? = null
-    private var encoderInputSurface: Surface? = null
+    // NAL queue: data listener (RTSP thread) → muxing thread
+    private data class NalUnit(val data: ByteArray, val timestamp: Long)
+    private var nalQueue: ArrayBlockingQueue<NalUnit>? = null
+    private var recordingSurfaceView: RtspSurfaceView? = null
+
+    // Direct muxing (no transcode — camera sends all-intra frames)
     private var muxer: MediaMuxer? = null
     private var videoTrackIndex = -1
     private var muxerStarted = false
-    private var pipelineReady = false
 
     val isRecording: Boolean get() = recordThread?.isAlive == true && !recordStopped.get()
 
@@ -135,15 +139,22 @@ class CaptureHelper(private val context: Context) {
     }
 
     // =====================================================================
-    // VIDEO RECORDING — MediaCodec transcode pipeline
+    // VIDEO RECORDING — direct mux (no transcode)
     //
-    // Camera sends all-intra H.264 with NAL type 1 (non-IDR), which MP4
-    // players can't decode from a cold start. We decode the camera's NALs
-    // through MediaCodec, then re-encode through a hardware encoder that
-    // produces proper IDR frames, and mux the encoder output to MP4.
+    // The camera sends all-intra H.264 frames labeled as NAL type 1
+    // (non-IDR). Since every frame is independently decodable, we can
+    // mux them directly into MP4 by:
+    //   1. Rewriting NAL type 1 → 5 (IDR) so players treat them as keyframes
+    //   2. Converting Annex B start codes → AVCC length prefixes for MP4
+    //   3. Setting BUFFER_FLAG_KEY_FRAME so the sync sample table is correct
+    //
+    // This avoids the decoder+encoder transcode pipeline entirely, which
+    // doesn't work on resource-limited devices (tablet's Snapdragon 429
+    // can't allocate a second hardware decoder, and the software decoder
+    // can't decode non-IDR frames from a cold start).
     // =====================================================================
 
-    fun startRecording(rtspUrl: String, wifiName: String, width: Int = 400, height: Int = 400) {
+    fun startRecording(surfaceView: RtspSurfaceView, rtspUrl: String, wifiName: String, width: Int = 400, height: Int = 400) {
         if (isRecording) {
             postError("Already recording")
             return
@@ -151,34 +162,32 @@ class CaptureHelper(private val context: Context) {
 
         recordStopped.set(false)
         recordingWifiName = wifiName
-        pipelineReady = false
         muxerStarted = false
         videoTrackIndex = -1
         startNanos = 0L
         frameCount = 0
+        recordingSurfaceView = surfaceView
+        nalQueue = ArrayBlockingQueue(NAL_QUEUE_CAPACITY)
 
         val tempFile = File(context.cacheDir, "recording_${System.currentTimeMillis()}.mp4")
         recordingOutputPath = tempFile.absolutePath
 
-        val listener = object : RtspClient.RtspClientListener {
-            override fun onRtspConnecting() {
-                Log.d(TAG, "Recording RTSP: connecting")
-            }
-
-            override fun onRtspConnected(sdpInfo: RtspClient.SdpInfo) {
-                Log.d(TAG, "Recording RTSP: connected, videoTrack=${sdpInfo.videoTrack}")
-                val sps = sdpInfo.videoTrack?.sps
-                val pps = sdpInfo.videoTrack?.pps
-                if (sps == null || pps == null) {
-                    Log.e(TAG, "No SPS/PPS in SDP — cannot record")
-                    postError("No video parameters from camera")
-                    recordStopped.set(true)
-                    return
+        recordThread = Thread({
+            try {
+                // 1. Get SPS/PPS via lightweight RTSP DESCRIBE
+                val spsPps = fetchSpsAndPps(rtspUrl)
+                if (spsPps == null) {
+                    Log.e(TAG, "Failed to get SPS/PPS via DESCRIBE")
+                    postError("Could not get video parameters")
+                    return@Thread
                 }
+                if (recordStopped.get()) return@Thread
 
-                val rawSps = stripStartCode(sps)
-                val rawPps = stripStartCode(pps)
-                val spsDims = parseSpsResolution(rawSps)
+                val (sps, pps) = spsPps
+                Log.d(TAG, "Got SPS (${sps.size}B) and PPS (${pps.size}B) from DESCRIBE")
+
+                // Parse resolution from SPS
+                val spsDims = parseSpsResolution(sps)
                 val vidW: Int
                 val vidH: Int
                 if (spsDims != null) {
@@ -191,229 +200,213 @@ class CaptureHelper(private val context: Context) {
                     Log.w(TAG, "SPS parse failed — using ${width}x${height}")
                 }
 
+                // 2. Init direct muxer (no decoder/encoder needed)
                 try {
-                    initTranscodePipeline(rawSps, rawPps, vidW, vidH)
+                    initDirectMux(sps, pps, vidW, vidH)
                     recordingStartTimeMs = System.currentTimeMillis()
                 } catch (e: Exception) {
-                    Log.e(TAG, "Pipeline init failed", e)
+                    Log.e(TAG, "Muxer init failed", e)
+                    cleanupMuxer()
                     postError("Recording init failed: ${e.message}")
-                    recordStopped.set(true)
+                    return@Thread
                 }
-            }
+                if (recordStopped.get()) {
+                    cleanupMuxer()
+                    return@Thread
+                }
 
-            override fun onRtspVideoNalUnitReceived(
-                data: ByteArray, offset: Int, length: Int, timestamp: Long
-            ) {
-                if (!pipelineReady || recordStopped.get()) return
-                if (length <= 4) return
+                // 3. Set data listener to start receiving NALs from live view
+                surfaceView.setDataListener(dataListener)
+                Log.d(TAG, "Data listener set — recording active")
 
-                if (startNanos == 0L) startNanos = System.nanoTime()
-                val pts = (System.nanoTime() - startNanos) / 1000 // μs
+                // 4. Consume NALs from queue and mux directly to MP4
+                while (!recordStopped.get()) {
+                    val nal = nalQueue?.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                    if (startNanos == 0L) startNanos = System.nanoTime()
+                    val pts = (System.nanoTime() - startNanos) / 1000 // μs
+                    frameCount++
+                    muxNalUnit(nal.data, 0, nal.data.size, pts)
+                }
 
-                frameCount++
-
-                // Feed raw data directly (with original start codes) — same as library
-                feedDecoderAndDrain(data, offset, length, pts)
-            }
-
-            override fun onRtspAudioSampleReceived(
-                data: ByteArray, offset: Int, length: Int, timestamp: Long
-            ) {}
-
-            override fun onRtspApplicationDataReceived(
-                data: ByteArray, offset: Int, length: Int, timestamp: Long
-            ) {}
-
-            override fun onRtspDisconnecting() {
-                Log.d(TAG, "Recording RTSP: disconnecting")
-            }
-
-            override fun onRtspDisconnected() {
-                Log.d(TAG, "Recording RTSP: disconnected")
+                // 5. Remove listener and finalize
+                surfaceView.setDataListener(null)
                 finalizeRecording()
-            }
 
-            override fun onRtspFailedUnauthorized() {
-                Log.e(TAG, "Recording RTSP: unauthorized")
-                postError("Recording connection unauthorized")
-                finalizeRecording()
-            }
-
-            override fun onRtspFailed(message: String?) {
-                Log.e(TAG, "Recording RTSP: failed — $message")
-                postError("Recording connection failed: $message")
-                finalizeRecording()
-            }
-        }
-
-        recordThread = Thread({
-            try {
-                val uri = Uri.parse(rtspUrl)
-                val host = uri.host ?: return@Thread
-                val port = if (uri.port > 0) uri.port else 554
-                val socket = NetUtils.createSocketAndConnect(host, port, 5000)
-                val client = RtspClient.Builder(socket, rtspUrl, recordStopped, listener)
-                    .requestVideo(true)
-                    .requestAudio(false)
-                    .withDebug(false)
-                    .withUserAgent("HawkEye Recorder")
-                    .build()
-                client.execute()
-                NetUtils.closeSocket(socket)
             } catch (e: Exception) {
                 Log.e(TAG, "Recording thread error", e)
-                postError("Recording failed: ${e.message}")
+                try { surfaceView.setDataListener(null) } catch (_: Exception) {}
                 finalizeRecording()
             }
-        }, "RtspRecorder")
+        }, "RecordMux")
         recordThread!!.start()
-        Log.d(TAG, "Recording started: $rtspUrl → $recordingOutputPath")
+        Log.d(TAG, "Recording started → $recordingOutputPath")
     }
 
-    private fun initTranscodePipeline(sps: ByteArray, pps: ByteArray, width: Int, height: Int) {
-        // 1. Create encoder — produces proper H.264 with real IDR frames
-        val encoderFormat = MediaFormat.createVideoFormat(
-            MediaFormat.MIMETYPE_VIDEO_AVC, width, height
-        ).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, ENCODER_BITRATE)
-            setInteger(MediaFormat.KEY_FRAME_RATE, ENCODER_FRAME_RATE)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, ENCODER_IDR_INTERVAL)
+    private val dataListener = object : RtspDataListener {
+        override fun onRtspDataVideoNalUnitReceived(
+            data: ByteArray, offset: Int, length: Int, timestamp: Long
+        ) {
+            if (recordStopped.get()) return
+            if (length <= 4) return
+            // Copy data (library may reuse buffer) and enqueue
+            val copy = ByteArray(length)
+            System.arraycopy(data, offset, copy, 0, length)
+            nalQueue?.offer(NalUnit(copy, timestamp)) // non-blocking, drops if full
         }
-        encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).also { enc ->
-            enc.configure(encoderFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            encoderInputSurface = enc.createInputSurface()
-            enc.start()
-        }
-        Log.d(TAG, "Encoder started: ${width}x${height}, ${ENCODER_BITRATE / 1000}kbps")
+    }
 
-        // 2. Create decoder — outputs decoded frames to encoder's input Surface.
-        // Must set low-latency options (same as rtsp-client-android library)
-        // to allow the decoder to start from non-IDR (type 1) NALs.
+    // =====================================================================
+    // RTSP DESCRIBE — lightweight SPS/PPS extraction
+    // =====================================================================
+
+    private fun fetchSpsAndPps(rtspUrl: String): Pair<ByteArray, ByteArray>? {
+        try {
+            val uri = Uri.parse(rtspUrl)
+            val host = uri.host ?: return null
+            val port = if (uri.port > 0) uri.port else 554
+
+            val socket = Socket()
+            socket.connect(InetSocketAddress(host, port), 3000)
+            socket.soTimeout = 3000
+
+            try {
+                val out = socket.getOutputStream()
+                val inp = BufferedReader(InputStreamReader(socket.getInputStream()))
+
+                val request = "DESCRIBE $rtspUrl RTSP/1.0\r\n" +
+                    "CSeq: 1\r\n" +
+                    "Accept: application/sdp\r\n" +
+                    "\r\n"
+                out.write(request.toByteArray())
+                out.flush()
+
+                // Read response headers
+                val response = StringBuilder()
+                var contentLength = 0
+                while (true) {
+                    val line = inp.readLine() ?: break
+                    if (line.startsWith("Content-Length:", ignoreCase = true)) {
+                        contentLength = line.substringAfter(":").trim().toIntOrNull() ?: 0
+                    }
+                    response.append(line).append('\n')
+                    if (line.isEmpty()) break // end of headers
+                }
+
+                // Read SDP body
+                if (contentLength > 0) {
+                    val body = CharArray(contentLength)
+                    var read = 0
+                    while (read < contentLength) {
+                        val n = inp.read(body, read, contentLength - read)
+                        if (n < 0) break
+                        read += n
+                    }
+                    response.append(body, 0, read)
+                }
+
+                val sdp = response.toString()
+                Log.d(TAG, "DESCRIBE response received (${sdp.length} chars)")
+
+                // Parse sprop-parameter-sets=<base64 SPS>,<base64 PPS>
+                val match = Regex("sprop-parameter-sets=([A-Za-z0-9+/=]+),([A-Za-z0-9+/=]+)")
+                    .find(sdp)
+                if (match != null) {
+                    val sps = Base64.decode(match.groupValues[1], Base64.NO_WRAP)
+                    val pps = Base64.decode(match.groupValues[2], Base64.NO_WRAP)
+                    return Pair(sps, pps)
+                }
+                Log.w(TAG, "No sprop-parameter-sets found in SDP")
+            } finally {
+                socket.close()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "DESCRIBE failed: ${e.message}")
+        }
+        return null
+    }
+
+    // =====================================================================
+    // DIRECT MUX — raw H.264 NALs → MP4 (no transcode)
+    // =====================================================================
+
+    private fun initDirectMux(sps: ByteArray, pps: ByteArray, width: Int, height: Int) {
         val sc = byteArrayOf(0, 0, 0, 1)
-        val decoderFormat = MediaFormat.createVideoFormat(
+        val format = MediaFormat.createVideoFormat(
             MediaFormat.MIMETYPE_VIDEO_AVC, width, height
         ).apply {
             setByteBuffer("csd-0", ByteBuffer.wrap(sc + sps))
             setByteBuffer("csd-1", ByteBuffer.wrap(sc + pps))
-            // Low-latency mode (Android 11+) — output frames immediately
-            try { setInteger("low-latency", 1) } catch (_: Exception) {}
-            // Qualcomm: max operating rate + realtime priority
-            try { setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt()) } catch (_: Exception) {}
-            try { setInteger(MediaFormat.KEY_PRIORITY, 0) } catch (_: Exception) {}
         }
-        val dec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        dec.configure(decoderFormat, encoderInputSurface, null, 0)
-
-        // Qualcomm vendor extensions for low-latency decode
-        try {
-            val params = android.os.Bundle()
-            params.putInt("vendor.qti-ext-dec-picture-order.enable", 1)
-            params.putInt("vendor.qti-ext-dec-low-latency.enable", 1)
-            dec.setParameters(params)
-            Log.d(TAG, "Set Qualcomm low-latency decoder params")
-        } catch (e: Exception) {
-            Log.d(TAG, "Qualcomm params not supported: ${e.message}")
-        }
-
-        dec.start()
-        decoder = dec
-        Log.d(TAG, "Decoder started with low-latency options")
-
-        // 3. Create muxer — started later when encoder outputs its format
         muxer = MediaMuxer(recordingOutputPath!!, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        Log.d(TAG, "Muxer created: $recordingOutputPath")
-
-        pipelineReady = true
+        videoTrackIndex = muxer!!.addTrack(format)
+        muxer!!.start()
+        muxerStarted = true
+        Log.d(TAG, "Direct muxer started: ${width}x${height}")
     }
 
-    private fun feedDecoderAndDrain(data: ByteArray, offset: Int, length: Int, pts: Long) {
-        val dec = decoder ?: return
-
-        // Feed raw data to decoder exactly as received (with original start codes)
-        val inputIndex = dec.dequeueInputBuffer(10_000) // 10ms timeout
-        if (inputIndex >= 0) {
-            val inputBuf = dec.getInputBuffer(inputIndex)!!
-            inputBuf.clear()
-            inputBuf.put(data, offset, length)
-            dec.queueInputBuffer(inputIndex, 0, length, pts, 0)
-        } else {
-            Log.w(TAG, "Decoder input full (frame $frameCount)")
+    private fun cleanupMuxer() {
+        if (muxerStarted) {
+            try { muxer?.stop() } catch (_: Exception) {}
         }
-
-        // Drain decoder — wait for output then render to encoder's input Surface.
-        // Hardware decoder needs a few ms to process each frame. Use a small
-        // timeout to give it time, then drain any remaining non-blocking.
-        val decInfo = MediaCodec.BufferInfo()
-        for (attempt in 0..3) {
-            val outIdx = dec.dequeueOutputBuffer(decInfo, 8_000) // 8ms timeout
-            if (outIdx >= 0) {
-                val render = decInfo.size > 0
-                dec.releaseOutputBuffer(outIdx, render)
-                // Drain any additional ready frames (non-blocking)
-                while (true) {
-                    val moreIdx = dec.dequeueOutputBuffer(decInfo, 0)
-                    if (moreIdx >= 0) {
-                        dec.releaseOutputBuffer(moreIdx, decInfo.size > 0)
-                    } else break
-                }
-                break
-            } else if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                Log.d(TAG, "Decoder output format changed: ${dec.outputFormat}")
-                continue
-            }
-        }
-
-        // Drain encoder — write encoded frames to muxer
-        drainEncoder(false)
+        try { muxer?.release() } catch (_: Exception) {}
+        muxer = null
+        muxerStarted = false
     }
 
-    private fun drainEncoder(endOfStream: Boolean) {
-        val enc = encoder ?: return
-        val mux = muxer ?: return
+    /**
+     * Convert a single NAL unit from Annex B (start codes) to AVCC (length prefix)
+     * and write it to the muxer. Rewrites NAL type 1 → 5 (IDR) so players treat
+     * every frame as a keyframe (camera sends all-intra but labels them as non-IDR).
+     */
+    private fun muxNalUnit(data: ByteArray, offset: Int, length: Int, pts: Long) {
+        if (!muxerStarted) return
 
-        if (endOfStream) {
-            enc.signalEndOfInputStream()
+        // Find start of NAL payload (skip 00 00 00 01 or 00 00 01)
+        val payloadStart = findNalPayloadStart(data, offset, length)
+        val payloadLen = length - (payloadStart - offset)
+        if (payloadLen <= 0) return
+
+        // Rewrite NAL type: 1 (non-IDR) → 5 (IDR) so MP4 players can seek
+        val nalHeader = data[payloadStart].toInt() and 0xFF
+        val nalType = nalHeader and 0x1F
+        if (nalType == 1) {
+            data[payloadStart] = ((nalHeader and 0xE0.toInt()) or 5).toByte()
         }
 
-        val encInfo = MediaCodec.BufferInfo()
-        while (true) {
-            val outIdx = enc.dequeueOutputBuffer(encInfo, if (endOfStream) 10_000 else 0)
-            when {
-                outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    val fmt = enc.outputFormat
-                    videoTrackIndex = mux.addTrack(fmt)
-                    mux.start()
-                    muxerStarted = true
-                    Log.d(TAG, "Muxer started with encoder format")
-                }
-                outIdx >= 0 -> {
-                    // Skip codec config buffers (SPS/PPS) — already in muxer track
-                    if (encInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                        enc.releaseOutputBuffer(outIdx, false)
-                        continue
-                    }
-                    if (muxerStarted && encInfo.size > 0) {
-                        val encodedBuf = enc.getOutputBuffer(outIdx)!!
-                        encodedBuf.position(encInfo.offset)
-                        encodedBuf.limit(encInfo.offset + encInfo.size)
-                        mux.writeSampleData(videoTrackIndex, encodedBuf, encInfo)
-                    }
-                    val isEos = encInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
-                    enc.releaseOutputBuffer(outIdx, false)
-                    if (isEos) return
-                }
-                else -> {
-                    if (endOfStream) {
-                        // Keep trying until we get EOS
-                        Thread.sleep(5)
-                        continue
-                    }
-                    break
-                }
-            }
+        // Build AVCC buffer: 4-byte big-endian length + NAL payload
+        val avccBuf = ByteBuffer.allocateDirect(4 + payloadLen)
+        avccBuf.putInt(payloadLen)
+        avccBuf.put(data, payloadStart, payloadLen)
+        avccBuf.flip()
+
+        val info = MediaCodec.BufferInfo().apply {
+            this.offset = 0
+            this.size = 4 + payloadLen
+            this.presentationTimeUs = pts
+            this.flags = MediaCodec.BUFFER_FLAG_KEY_FRAME
         }
+
+        try {
+            muxer!!.writeSampleData(videoTrackIndex, avccBuf, info)
+        } catch (e: Exception) {
+            Log.w(TAG, "Muxer write error on frame $frameCount: ${e.message}")
+        }
+    }
+
+    /**
+     * Find the byte offset where the NAL payload starts (after start code).
+     * Handles both 3-byte (00 00 01) and 4-byte (00 00 00 01) start codes.
+     */
+    private fun findNalPayloadStart(data: ByteArray, offset: Int, length: Int): Int {
+        if (length >= 4 && data[offset] == 0.toByte() && data[offset + 1] == 0.toByte() &&
+            data[offset + 2] == 0.toByte() && data[offset + 3] == 1.toByte()) {
+            return offset + 4
+        }
+        if (length >= 3 && data[offset] == 0.toByte() && data[offset + 1] == 0.toByte() &&
+            data[offset + 2] == 1.toByte()) {
+            return offset + 3
+        }
+        return offset // No start code found — assume raw NAL
     }
 
     fun stopRecording() {
@@ -428,59 +421,11 @@ class CaptureHelper(private val context: Context) {
         val wifiName = recordingWifiName ?: "Camera"
 
         try {
-            // Flush decoder — send EOS and drain remaining frames
-            val dec = decoder
-            if (dec != null && pipelineReady) {
-                try {
-                    val eosIdx = dec.dequeueInputBuffer(5_000)
-                    if (eosIdx >= 0) {
-                        dec.queueInputBuffer(eosIdx, 0, 0, 0,
-                            MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                    }
-                    val decInfo = MediaCodec.BufferInfo()
-                    var draining = true
-                    while (draining) {
-                        val outIdx = dec.dequeueOutputBuffer(decInfo, 10_000)
-                        if (outIdx >= 0) {
-                            val eos = decInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
-                            dec.releaseOutputBuffer(outIdx, decInfo.size > 0)
-                            if (eos) draining = false
-                        } else {
-                            draining = false
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Decoder flush error", e)
-                }
-            }
-
-            // Flush encoder — drain remaining frames and signal EOS to muxer
-            if (pipelineReady) {
-                try {
-                    drainEncoder(true)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Encoder flush error", e)
-                }
-            }
-
-            // Release codec resources
-            try { decoder?.stop() } catch (_: Exception) {}
-            try { decoder?.release() } catch (_: Exception) {}
-            decoder = null
-
-            try { encoder?.stop() } catch (_: Exception) {}
-            try { encoder?.release() } catch (_: Exception) {}
-            encoder = null
-
-            encoderInputSurface?.release()
-            encoderInputSurface = null
-
-            if (muxerStarted) {
+            if (muxerStarted && frameCount > 0) {
                 try { muxer?.stop() } catch (_: Exception) {}
                 try { muxer?.release() } catch (_: Exception) {}
                 muxer = null
                 muxerStarted = false
-                pipelineReady = false
 
                 Log.d(TAG, "Recording finalized: $outputPath (${durationMs}ms, $frameCount frames)")
 
@@ -500,17 +445,19 @@ class CaptureHelper(private val context: Context) {
                     }
                 }, "VideoSave").start()
             } else {
-                muxer?.release()
-                muxer = null
-                pipelineReady = false
+                cleanupMuxer()
                 File(outputPath).delete()
-                Log.w(TAG, "Muxer was never started — no video saved")
+                Log.w(TAG, "No frames recorded — no video saved")
+                postError("Recording failed — no video data captured")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Recording finalize error", e)
-            pipelineReady = false
+            cleanupMuxer()
         }
+
         recordingOutputPath = null
+        recordingSurfaceView = null
+        nalQueue = null
     }
 
     private fun saveVideoToGallery(tempPath: String, wifiName: String): String? {
@@ -550,51 +497,20 @@ class CaptureHelper(private val context: Context) {
     fun release() {
         if (isRecording) {
             recordStopped.set(true)
+            try { recordingSurfaceView?.setDataListener(null) } catch (_: Exception) {}
             recordThread?.join(3000)
         }
-        try { decoder?.stop() } catch (_: Exception) {}
-        try { decoder?.release() } catch (_: Exception) {}
-        decoder = null
-        try { encoder?.stop() } catch (_: Exception) {}
-        try { encoder?.release() } catch (_: Exception) {}
-        encoder = null
-        encoderInputSurface?.release()
-        encoderInputSurface = null
-        if (muxerStarted) {
-            try { muxer?.stop() } catch (_: Exception) {}
-        }
-        try { muxer?.release() } catch (_: Exception) {}
-        muxer = null
-        muxerStarted = false
-        pipelineReady = false
+        cleanupMuxer()
         recordingOutputPath?.let { File(it).delete() }
         recordingOutputPath = null
+        recordingSurfaceView = null
+        nalQueue = null
         callback = null
     }
 
     // =====================================================================
     // UTILITIES
     // =====================================================================
-
-    private fun findNalUnitStart(data: ByteArray, offset: Int, length: Int, maxScan: Int = 32): Int {
-        val end = offset + minOf(length, maxScan)
-        var lastNalStart = -1
-        var i = offset
-        while (i < end - 2) {
-            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() && data[i + 2] == 1.toByte()) {
-                lastNalStart = i + 3
-                i = lastNalStart
-            } else {
-                i++
-            }
-        }
-        return if (lastNalStart >= 0) lastNalStart else offset
-    }
-
-    private fun stripStartCode(data: ByteArray): ByteArray {
-        val nalStart = findNalUnitStart(data, 0, data.size)
-        return if (nalStart > 0) data.copyOfRange(nalStart, data.size) else data
-    }
 
     private fun sanitizeFolderName(name: String): String {
         return name.replace(Regex("[^a-zA-Z0-9_\\-]"), "_").ifEmpty { "Camera" }
