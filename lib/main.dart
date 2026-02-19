@@ -100,7 +100,7 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
   // UI/state
   bool _connecting = false;
   bool _isRtspMode = false;
-  String _status = 'Idle';
+  String _status = 'Idle'; // ignore: unused_field — kept for debug setState breadcrumbs
 
   // WiFi name
   String? _wifiName;
@@ -112,13 +112,14 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
   // Watchdog: periodic check to recover from any missed reconnect scenario
   Timer? _watchdogTimer;
 
-  // Location permission — only request once per app session
-  bool _locationPermissionRequested = false;
-
   // Video aspect ratio — auto-detected from stream
   double _videoAspectRatio = 1.0;
   int _videoWidth = 0;
   int _videoHeight = 0;
+
+  // Toolbar insets — track last sent orientation to avoid redundant calls
+  Orientation? _lastInsetOrientation;
+  static const double _toolbarReserve = 64.0; // logical px reserved for toolbar
 
   // Capture state
   bool _isRecording = false;
@@ -413,12 +414,34 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
     }
   }
 
+  /// Reads WiFi SSID only if location permission is already granted (no prompt).
+  /// Safe to call on init, WiFi restore, resume — never shows a permission dialog.
   Future<void> _detectWifiName() async {
     try {
-      // Check if location permission is already granted — only request once
+      final status = await Permission.location.status;
+      if (status.isGranted) {
+        final info = NetworkInfo();
+        final name = await info.getWifiName();
+        if (name != null && mounted) {
+          setState(() {
+            _wifiName = name.replaceAll('"', '');
+          });
+          debugPrint('[HAWKEYE] WiFi SSID: $_wifiName');
+        }
+      } else {
+        debugPrint('[HAWKEYE] Location not yet granted — skipping WiFi name');
+      }
+    } catch (e) {
+      debugPrint('[HAWKEYE] WiFi name detection failed: $e');
+    }
+  }
+
+  /// Requests location permission if needed, then detects WiFi name.
+  /// Call from capture actions and WiFi button tap.
+  Future<void> _ensureWifiNameForCapture() async {
+    try {
       var status = await Permission.location.status;
-      if (!status.isGranted && !_locationPermissionRequested) {
-        _locationPermissionRequested = true;
+      if (!status.isGranted) {
         status = await Permission.location.request();
       }
       if (status.isGranted) {
@@ -427,18 +450,12 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
         if (name != null && mounted) {
           setState(() {
             _wifiName = name.replaceAll('"', '');
-            // Update status text if already streaming
-            if (_nativeSurfaceState == 'playing') {
-              _status = 'Streaming from $_wifiName';
-            }
           });
-          debugPrint('[HAWKEYE] WiFi SSID: $_wifiName');
+          debugPrint('[HAWKEYE] WiFi SSID (ensured): $_wifiName');
         }
-      } else {
-        debugPrint('[HAWKEYE] Location permission not granted — cannot get WiFi name');
       }
     } catch (e) {
-      debugPrint('[HAWKEYE] WiFi name detection failed: $e');
+      debugPrint('[HAWKEYE] WiFi name ensure failed: $e');
     }
   }
 
@@ -670,6 +687,10 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
         _nativeOverlayActive = true;
         _status = 'Connecting...';
       });
+      // Send insets so native sizes video with room for toolbar
+      _lastInsetOrientation = null; // force re-send
+      final orientation = MediaQuery.of(context).orientation;
+      _sendInsets(orientation);
 
       // Wait for VLC event (playing or error) — event handler updates _nativeSurfaceState
       for (int i = 0; i < 20; i++) { // 10 seconds max
@@ -696,6 +717,36 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
     }
   }
 
+  /// Send reserved insets to native so the video is sized to leave room for toolbar.
+  void _sendInsets(Orientation orientation) {
+    if (!_nativeOverlayActive) return;
+    if (orientation == _lastInsetOrientation) return;
+    _lastInsetOrientation = orientation;
+
+    final dpr = WidgetsBinding.instance.platformDispatcher.views.first.devicePixelRatio;
+    final reserve = (_toolbarReserve * dpr).round();
+
+    final int left, top, right, bottom;
+    if (orientation == Orientation.landscape) {
+      // Reserve symmetric left/right for toolbar on right
+      left = reserve;
+      top = 0;
+      right = reserve;
+      bottom = 0;
+    } else {
+      // Reserve bottom for toolbar in portrait
+      left = 0;
+      top = 0;
+      right = 0;
+      bottom = reserve;
+    }
+
+    _nativeChannel.invokeMethod('overlay_setInsets', {
+      'left': left, 'top': top, 'right': right, 'bottom': bottom,
+    }).catchError((_) {});
+    debugPrint('[HAWKEYE] Sent insets: L=$left T=$top R=$right B=$bottom (orientation=$orientation)');
+  }
+
   // ---- Capture: photo + video recording -----------------------------------
 
   Future<void> _requestStoragePermissions() async {
@@ -711,6 +762,7 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
 
   Future<void> _capturePhoto() async {
     if (!_isRtspMode || _lastRtspUrl == null) return;
+    await _ensureWifiNameForCapture();
     await _requestStoragePermissions();
     final wifiName = _wifiName ?? 'Camera';
     try {
@@ -733,6 +785,7 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
     } else {
       // Start recording
       if (!_isRtspMode || _lastRtspUrl == null) return;
+      await _ensureWifiNameForCapture();
       await _requestStoragePermissions();
       final wifiName = _wifiName ?? 'Camera';
       try {
@@ -769,9 +822,30 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
 
   // ---- UI ----------------------------------------------------------------
 
+  void _onWifiButtonTap() async {
+    await _ensureWifiNameForCapture();
+    if (!mounted) return;
+    final message = _wifiName != null
+        ? 'Connected to $_wifiName'
+        : 'Not connected';
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
+    final orientation = MediaQuery.of(context).orientation;
+    // Send insets to native when orientation changes
+    if (_nativeOverlayActive) {
+      _sendInsets(orientation);
+    }
+
+    final isLandscape = orientation == Orientation.landscape;
 
     return Scaffold(
       backgroundColor: Colors.transparent,
@@ -787,103 +861,126 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
           // Photo flash feedback
           if (_photoFlash)
             Container(color: const Color(0xBBFFFFFF)),
-          // Capture bar at bottom (visible when streaming, status-only when not)
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 0,
-            child: Container(
-              padding: EdgeInsets.symmetric(
-                horizontal: isLandscape ? 20 : 12,
-                vertical: 8,
-              ),
-              decoration: const BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.bottomCenter,
-                  end: Alignment.topCenter,
-                  colors: [Color(0xCC000000), Color(0x00000000)],
+          // Toolbar (visible when streaming)
+          if (_isRtspMode)
+            isLandscape ? _buildLandscapeToolbar() : _buildPortraitToolbar(),
+        ],
+      ),
+    );
+  }
+
+  /// Landscape: vertical column on the right, centered vertically.
+  Widget _buildLandscapeToolbar() {
+    return Positioned(
+      right: 8,
+      top: 0,
+      bottom: 0,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _buildToolbarButton(
+              icon: Icons.wifi,
+              color: Colors.green,
+              onPressed: _onWifiButtonTap,
+            ),
+            const SizedBox(height: 12),
+            _buildToolbarButton(
+              icon: Icons.camera_alt,
+              color: Colors.black,
+              onPressed: _capturePhoto,
+            ),
+            const SizedBox(height: 12),
+            _buildToolbarButton(
+              icon: _isRecording ? Icons.stop : Icons.videocam,
+              color: _isRecording ? Colors.white : const Color(0xFFFF0000),
+              background: _isRecording ? const Color(0x44FF0000) : null,
+              onPressed: _toggleRecording,
+            ),
+            if (_isRecording) ...[
+              const SizedBox(height: 4),
+              Text(
+                _formatDuration(_recordingDuration),
+                style: const TextStyle(
+                  color: Color(0xFFFF4444),
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
                 ),
               ),
-              child: SafeArea(
-                top: false,
-                child: _isRtspMode
-                    ? _buildCaptureBar(isLandscape)
-                    : _buildStatusOnly(),
-              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Portrait: horizontal row at the bottom, centered horizontally.
+  Widget _buildPortraitToolbar() {
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: 8,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _buildToolbarButton(
+                  icon: Icons.wifi,
+                  color: Colors.green,
+                  onPressed: _onWifiButtonTap,
+                ),
+                const SizedBox(width: 12),
+                _buildToolbarButton(
+                  icon: Icons.camera_alt,
+                  color: Colors.black,
+                  onPressed: _capturePhoto,
+                ),
+                const SizedBox(width: 12),
+                _buildToolbarButton(
+                  icon: _isRecording ? Icons.stop : Icons.videocam,
+                  color: _isRecording ? Colors.white : const Color(0xFFFF0000),
+                  background: _isRecording ? const Color(0x44FF0000) : null,
+                  onPressed: _toggleRecording,
+                ),
+              ],
             ),
-          ),
-        ],
+            if (_isRecording) ...[
+              const SizedBox(height: 4),
+              Text(
+                _formatDuration(_recordingDuration),
+                style: const TextStyle(
+                  color: Color(0xFFFF4444),
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }
 
-  Widget _buildStatusOnly() {
-    return Text(
-      _status,
-      style: const TextStyle(color: Colors.white70, fontSize: 13),
-      textAlign: TextAlign.center,
-      maxLines: 2,
-      overflow: TextOverflow.ellipsis,
-    );
-  }
-
-  Widget _buildCaptureBar(bool isLandscape) {
-    final statusText = Text(
-      _isRecording
-          ? 'REC ${_formatDuration(_recordingDuration)}'
-          : _status,
-      style: TextStyle(
-        color: _isRecording ? const Color(0xFFFF4444) : Colors.white70,
-        fontSize: 13,
-        fontWeight: _isRecording ? FontWeight.bold : FontWeight.normal,
+  Widget _buildToolbarButton({
+    required IconData icon,
+    required Color color,
+    required VoidCallback onPressed,
+    Color? background,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        color: background ?? const Color(0xFF555555),
+        borderRadius: BorderRadius.circular(8),
       ),
-      maxLines: 1,
-      overflow: TextOverflow.ellipsis,
+      child: IconButton(
+        onPressed: onPressed,
+        icon: Icon(icon, color: color, size: 28),
+        padding: const EdgeInsets.all(10),
+        constraints: const BoxConstraints(),
+      ),
     );
-
-    final buttons = Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        // Photo button
-        IconButton(
-          onPressed: _capturePhoto,
-          icon: const Icon(Icons.camera_alt, color: Colors.white, size: 28),
-          tooltip: 'Take photo',
-          padding: const EdgeInsets.all(8),
-          constraints: const BoxConstraints(),
-        ),
-        const SizedBox(width: 16),
-        // Record button
-        IconButton(
-          onPressed: _toggleRecording,
-          icon: Icon(
-            _isRecording ? Icons.stop_circle : Icons.fiber_manual_record,
-            color: _isRecording ? const Color(0xFFFF4444) : Colors.white,
-            size: 32,
-          ),
-          tooltip: _isRecording ? 'Stop recording' : 'Start recording',
-          padding: const EdgeInsets.all(8),
-          constraints: const BoxConstraints(),
-        ),
-      ],
-    );
-
-    if (isLandscape) {
-      return Row(
-        children: [
-          Expanded(child: statusText),
-          buttons,
-        ],
-      );
-    } else {
-      return Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          statusText,
-          const SizedBox(height: 4),
-          buttons,
-        ],
-      );
-    }
   }
 }

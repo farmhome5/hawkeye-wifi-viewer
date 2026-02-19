@@ -48,6 +48,14 @@ class MainActivity : FlutterActivity() {
                     overlayDispose()
                     result.success(true)
                 }
+                "overlay_setInsets" -> {
+                    val left = call.argument<Int>("left") ?: 0
+                    val top = call.argument<Int>("top") ?: 0
+                    val right = call.argument<Int>("right") ?: 0
+                    val bottom = call.argument<Int>("bottom") ?: 0
+                    mediaHelper?.setReservedInsets(left, top, right, bottom)
+                    result.success(true)
+                }
                 "overlay_isPlaying" -> {
                     result.success(mediaHelper?.isPlaying == true)
                 }

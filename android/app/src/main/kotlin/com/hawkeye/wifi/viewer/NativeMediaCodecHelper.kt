@@ -31,6 +31,12 @@ class NativeMediaCodecHelper(private val context: Context) {
     private val uiHandler = Handler(Looper.getMainLooper())
     private var parentLayoutListener: View.OnLayoutChangeListener? = null
 
+    // Reserved insets (pixels) — space reserved for Flutter UI toolbar
+    private var reservedLeft = 0
+    private var reservedTop = 0
+    private var reservedRight = 0
+    private var reservedBottom = 0
+
     /**
      * Create and return an RtspSurfaceView (extends SurfaceView).
      * Caller adds this to the FrameLayout at index 0, behind Flutter.
@@ -129,6 +135,18 @@ class NativeMediaCodecHelper(private val context: Context) {
         parent.addOnLayoutChangeListener(parentLayoutListener)
     }
 
+    /**
+     * Set reserved insets (in pixels) for Flutter UI elements.
+     * The video will be sized and centered within the remaining area.
+     */
+    fun setReservedInsets(left: Int, top: Int, right: Int, bottom: Int) {
+        reservedLeft = left
+        reservedTop = top
+        reservedRight = right
+        reservedBottom = bottom
+        updateViewAspectRatio()
+    }
+
     private fun updateViewAspectRatio() {
         val sv = rtspSurfaceView ?: return
         if (videoWidth <= 0 || videoHeight <= 0) return
@@ -137,30 +155,37 @@ class NativeMediaCodecHelper(private val context: Context) {
         val parentH = parent.height
         if (parentW <= 0 || parentH <= 0) return
 
+        // Available area after reserving space for UI
+        val availW = parentW - reservedLeft - reservedRight
+        val availH = parentH - reservedTop - reservedBottom
+        if (availW <= 0 || availH <= 0) return
+
         val videoAspect = videoWidth.toFloat() / videoHeight.toFloat()
-        val parentAspect = parentW.toFloat() / parentH.toFloat()
+        val availAspect = availW.toFloat() / availH.toFloat()
 
         val viewW: Int
         val viewH: Int
-        if (videoAspect > parentAspect) {
-            // Video wider than parent — fit width, letterbox top/bottom
-            viewW = parentW
-            viewH = (parentW / videoAspect).toInt()
+        if (videoAspect > availAspect) {
+            // Video wider than available — fit width, letterbox top/bottom
+            viewW = availW
+            viewH = (availW / videoAspect).toInt()
         } else {
-            // Video taller than parent — fit height, pillarbox left/right
-            viewW = (parentH * videoAspect).toInt()
-            viewH = parentH
+            // Video taller than available — fit height, pillarbox left/right
+            viewW = (availH * videoAspect).toInt()
+            viewH = availH
         }
 
-        // Use margins to center — Gravity.CENTER is unreliable in FlutterView's layout
-        val marginH = (parentW - viewW) / 2
-        val marginV = (parentH - viewH) / 2
+        // Center within the available area (offset by reserved insets)
+        val marginLeft = reservedLeft + (availW - viewW) / 2
+        val marginTop = reservedTop + (availH - viewH) / 2
+        val marginRight = parentW - marginLeft - viewW
+        val marginBottom = parentH - marginTop - viewH
 
         sv.layoutParams = FrameLayout.LayoutParams(viewW, viewH).apply {
-            setMargins(marginH, marginV, marginH, marginV)
+            setMargins(marginLeft, marginTop, marginRight, marginBottom)
         }
 
-        Log.d(TAG, "Aspect ratio: ${videoWidth}x${videoHeight} -> view ${viewW}x${viewH} in ${parentW}x${parentH}")
+        Log.d(TAG, "Aspect ratio: ${videoWidth}x${videoHeight} -> view ${viewW}x${viewH} in ${parentW}x${parentH} (insets L=$reservedLeft T=$reservedTop R=$reservedRight B=$reservedBottom)")
     }
 
     fun play(rtspUrl: String) {
