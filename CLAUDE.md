@@ -40,17 +40,27 @@ RtspSurfaceView (aspect-ratio-sized) behind transparent Flutter UI (`Transparenc
 
 RTSP events flow: `RtspStatusListener` → `NativeMediaCodecHelper` → `VlcEventCallback` → `MainActivity` → MethodChannel `nativeEvent` → Flutter `_onNativeMethodCall`. Events: `playing`, `error`, `ended`, `stopped`, `videoSize`, `foregrounded`.
 
-Auto-reconnect uses a two-tier strategy: fast replay (first 6 attempts at 500ms intervals, just retries the same RTSP URL) then falls back to full probe with exponential backoff (300ms–5s). Max 10 total attempts.
+Auto-reconnect uses a two-tier strategy: fast replay (first 3 attempts at 1s intervals with full dispose+init cycle) then falls back to full probe with exponential backoff (1s–8s). Max 10 total attempts. Only one RTSP URL is tried per probe cycle to avoid flooding the camera's single-client RTSP server.
 
 ### Recovery & Resilience
 
 Multiple layers handle stream recovery:
 
-1. **Fast replay / full probe** — handles brief stream interruptions while WiFi is up
+1. **Fast replay / full probe** — handles brief stream interruptions while WiFi is up. Fast replay does full dispose+init (not just stop+play) to ensure clean decoder state.
 2. **Connectivity monitoring** (`connectivity_plus`) — detects WiFi drop/restore, pauses reconnect when offline, re-probes on WiFi restore
-3. **Native lifecycle** (`onStop`/`onStart`) — `MainActivity.onStop()` stops the stream, `onStart()` sends `foregrounded` event to Flutter for a fresh probe. More reliable than Flutter's `WidgetsBindingObserver` on Samsung devices.
-4. **Watchdog timer** (5s) — queries native `overlay_isPlaying` (checks `surface.isValid`) to detect silently-dead streams (e.g. surface destroyed without RTSP disconnect event). Force-resets stuck probes.
-5. **Probe generation counter** (`_probeId`) — prevents stale async probes from interfering when a newer probe is started by lifecycle/watchdog.
+3. **Native lifecycle** (`onStop`/`onStart`) — `MainActivity.onStop()` stops the stream, `onStart()` sends `foregrounded` event to Flutter for a fresh probe. Flutter's `WidgetsBindingObserver.resumed` is NOT used — native lifecycle is the sole recovery trigger on Samsung.
+4. **Watchdog timer** (5s) — queries native `overlay_isPlaying` (checks `surface.isValid`) to detect silently-dead streams. Only force-resets probes stuck for >20s to avoid flooding.
+5. **Probe generation counter** (`_probeId`) — checked at every key step (after dispose, after port scan, after WebSocket, after HTTP, before RTSP play) so stale probes bail immediately.
+
+#### Anti-Flooding Design
+
+The camera's RTSP server only supports one client at a time. Concurrent connection attempts overwhelm it into a permanent error state requiring app restart. Critical invariants:
+
+- **Never run concurrent probes** — `_connecting` flag gates entry; `foregrounded` skips if a probe is already running
+- **One RTSP URL per probe** — only tries the primary `/preview` path, not multiple URLs
+- **500ms delay after dispose** — gives camera time to release old RTSP session before new connection
+- **Spaced retries** — 1s minimum between attempts (was 300-500ms), exponential backoff up to 8s
+- **Watchdog patience** — waits 20s before force-resetting a probe (was 5s)
 
 On every reconnect, the overlay is fully disposed and recreated (`overlay_dispose` + `overlay_init`) to prevent pixelation from stale decoder state.
 
@@ -84,14 +94,22 @@ Camera sends all H.264 frames as **non-IDR (NAL type 1)** but they are all-intra
 
 A transcode pipeline (decoder→encoder) was tried first but doesn't work on resource-limited devices — the tablet's Snapdragon 429 can't allocate a second hardware decoder (error 0x80001001), and the software decoder can't produce output from non-IDR frames.
 
-### Capture Bar UI
+### Toolbar UI
 
-Bottom bar replaces the old floating status text. Adaptive layout:
-- **Landscape**: `Row` — status text left, photo + record buttons right
-- **Portrait**: `Column` — status text top, buttons below
-- Visible when streaming; falls back to status-only text when connecting/loading
-- Record button turns red with elapsed timer during recording
+Right-side vertical toolbar (V3 View style) replaces the old bottom capture bar. No status text displayed in UI.
+
+- **Landscape**: Vertical column on the right, centered vertically. Symmetric left/right insets reserve space so video doesn't overlap buttons.
+- **Portrait**: Horizontal row at the bottom, centered. Bottom inset reserves space below video.
+- Three buttons: WiFi status (green when streaming, shows SSID snackbar on tap), camera (black icon, photo capture), videocam (red icon, video recording)
+- Button background: `#555555` gray, `borderRadius: 8`
+- Record button turns red with stop icon and elapsed timer during recording
 - Photo capture shows brief white flash overlay as feedback
+- Loading spinner (CircularProgressIndicator) shown when connecting
+- Location permission requested lazily on first capture/WiFi tap, not on launch
+
+### Native Video Insets
+
+`NativeMediaCodecHelper` supports reserved insets (`setReservedInsets`) so Flutter can reserve space for the toolbar. Video is aspect-ratio-fitted within the available area after subtracting insets, then centered with margin-based positioning. Flutter sends insets via `overlay_setInsets` MethodChannel call on orientation change.
 
 ## MethodChannel API
 
@@ -103,6 +121,7 @@ Channel: `hawkeye/native_vlc`
 | `overlay_play`       | Flutter→Native | Start RTSP stream (pass URL)   |
 | `overlay_stop`       | Flutter→Native | Stop playback                  |
 | `overlay_dispose`    | Flutter→Native | Release resources              |
+| `overlay_setInsets`  | Flutter→Native | Set reserved insets for toolbar |
 | `overlay_isPlaying`  | Flutter→Native | Query playback state           |
 | `overlay_getVideoSize` | Flutter→Native | Get current video dimensions  |
 | `capture_photo`      | Flutter→Native | Take still photo (PixelCopy)   |
