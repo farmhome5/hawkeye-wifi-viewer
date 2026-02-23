@@ -1,6 +1,6 @@
 # Hawkeye WiFi Viewer
 
-RTSP video streaming app for WiFi cameras. Flutter UI with native Kotlin MediaCodec integration.
+RTSP video streaming app for Q2 WiFi borescope cameras. Flutter UI with native Kotlin MediaCodec integration.
 
 ## Tech Stack
 
@@ -40,7 +40,7 @@ RtspSurfaceView (aspect-ratio-sized) behind transparent Flutter UI (`Transparenc
 
 RTSP events flow: `RtspStatusListener` → `NativeMediaCodecHelper` → `VlcEventCallback` → `MainActivity` → MethodChannel `nativeEvent` → Flutter `_onNativeMethodCall`. Events: `playing`, `error`, `ended`, `stopped`, `videoSize`, `foregrounded`.
 
-Auto-reconnect uses a two-tier strategy: fast replay (first 3 attempts at 1s intervals with full dispose+init cycle) then falls back to full probe with exponential backoff (1s–8s). Max 10 total attempts. Only one RTSP URL is tried per probe cycle to avoid flooding the camera's single-client RTSP server.
+Auto-reconnect uses a two-tier strategy: fast replay (first 3 attempts at 1s intervals with full dispose+init cycle) then falls back to full probe with exponential backoff (1s-8s). Max 10 total attempts. Only one RTSP URL is tried per probe cycle to avoid flooding the camera's single-client RTSP server.
 
 ### Recovery & Resilience
 
@@ -64,6 +64,10 @@ The camera's RTSP server only supports one client at a time. Concurrent connecti
 
 On every reconnect, the overlay is fully disposed and recreated (`overlay_dispose` + `overlay_init`) to prevent pixelation from stale decoder state.
 
+### Connection Hint
+
+A 10-second timer shows "check Q2 borescope WiFi network" when the camera is unreachable. The timer must NOT reset on each probe (watchdog fires every ~5s, would prevent the timer from ever reaching 10s). Pattern: check if already showing, check if timer already active, only then start a new timer. Cancel on `playing` event, reset on `foregrounded`.
+
 ### Screen Wake Lock
 
 `keepScreenOn` is set on the RtspSurfaceView when the stream starts playing, and cleared when it stops. This prevents the device from sleeping while actively streaming.
@@ -83,9 +87,12 @@ An `OnLayoutChangeListener` on the parent container detects dimension changes on
 `CaptureHelper.kt` handles both photo capture and video recording:
 
 - **Photos**: `PixelCopy.request()` on the SurfaceView → JPEG saved to `DCIM/{wifiName}/` via MediaStore (API 29+) or direct file + MediaScanner (API 24-28)
-- **Video**: Taps into the live view's NAL stream via `RtspSurfaceView.setDataListener()`, rewrites NAL type 1→5 (IDR), converts Annex B→AVCC format, and muxes directly to MP4 via `MediaMuxer`. Saved to `DCIM/{wifiName}/`
-- SPS/PPS are fetched via a lightweight RTSP DESCRIBE request (single TCP exchange, no SETUP/PLAY)
-- NALs flow through an `ArrayBlockingQueue` to decouple the RTSP thread from the muxing thread
+- **Video**: Taps into the live view's NAL stream via `RtspSurfaceView.setDataListener()`:
+  1. SPS/PPS fetched via lightweight RTSP DESCRIBE request (single TCP exchange, no SETUP/PLAY)
+  2. NAL payloads copied to clean byte arrays via `ArrayBlockingQueue` (decouples RTSP thread)
+  3. NAL type 1 rewritten to type 5 (IDR) for gallery thumbnail generation
+  4. Every frame marked as `BUFFER_FLAG_KEY_FRAME` (camera sends all-intra)
+  5. Saved to `DCIM/{wifiName}/`
 - Recording automatically stops on `onStop()` or `overlay_dispose` (stream destruction)
 
 #### Direct Mux Approach
@@ -93,6 +100,12 @@ An `OnLayoutChangeListener` on the parent container detects dimension changes on
 Camera sends all H.264 frames as **non-IDR (NAL type 1)** but they are all-intra (independently decodable). The direct mux approach rewrites NAL type 1→5 and sets `BUFFER_FLAG_KEY_FRAME` so MP4 players treat every frame as a sync sample.
 
 A transcode pipeline (decoder→encoder) was tried first but doesn't work on resource-limited devices — the tablet's Snapdragon 429 can't allocate a second hardware decoder (error 0x80001001), and the software decoder can't produce output from non-IDR frames.
+
+#### MediaMuxer Pitfalls
+
+- **Do NOT add AVCC length prefixes** — `MediaMuxer.writeSampleData()` handles them internally. Adding `putInt(len)` creates a double prefix that corrupts playback entirely.
+- **Do NOT use `ByteBuffer.wrap(array, offset, len)`** — with `BufferInfo.offset=0`, MediaMuxer may read from array start instead of buffer position, corrupting the lower-right corner of the video. Always copy NAL payload to a clean array first: `ByteBuffer.wrap(cleanArray)`.
+- **Gallery thumbnails**: NAL type 1→5 rewrite is intended to help, but Q2 thumbnails may still show a placeholder (IDR slice header mismatch with `idr_pic_id` field).
 
 ### Toolbar UI
 
@@ -104,7 +117,7 @@ Right-side vertical toolbar (V3 View style) replaces the old bottom capture bar.
 - Button background: `#555555` gray, `borderRadius: 8`
 - Record button turns red with stop icon and elapsed timer during recording
 - Photo capture shows brief white flash overlay as feedback
-- Loading spinner (CircularProgressIndicator) shown when connecting
+- Loading spinner (CircularProgressIndicator) shown when connecting, with connection hint after 10s
 - Location permission requested lazily on first capture/WiFi tap, not on launch
 
 ### Native Video Insets
@@ -170,8 +183,12 @@ INTERNET, ACCESS_WIFI_STATE, ACCESS_NETWORK_STATE, ACCESS_FINE_LOCATION, CHANGE_
 - ProGuard keeps rtsp-client-android classes (`com.alexvas.**`) and app classes
 - No automated tests or CI/CD currently configured
 - Test tablet: Samsung SM-T290, device ID `R9WN809CT0J`
-- Test phone: Samsung, device ID `R5CX15DGA2H`
+- Test phone: Samsung SM-S926U, device ID `R5CX15DGA2H`
 - Android window/launch backgrounds must be black (not white) for optimal viewing
 - Samsung phones need native `onStop`/`onStart` lifecycle for reliable recovery — Flutter's `WidgetsBindingObserver` is unreliable on Samsung
 - Camera protocol: WebSocket on :2023 → HTTP GET /live_streaming → RTSP on :554/preview
-- Camera IP: 192.168.42.1 (Q2VIEW WiFi network)
+- Camera IP: 192.168.42.1 (Q2 borescope WiFi network, user-configurable SSID)
+
+## Sister Project
+
+**Hawkeye Xplor Viewer** (`C:\Users\holmes\Projects\hawkeye_xplor_viewer`) — same UI, but uses Jieli SDK for Xplor borescope cameras (proprietary UDP, not RTSP). Decision: keep as separate apps (different streaming protocols benefit from isolation).
