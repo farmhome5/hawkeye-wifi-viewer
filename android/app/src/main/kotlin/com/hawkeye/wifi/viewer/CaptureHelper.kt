@@ -142,11 +142,11 @@ class CaptureHelper(private val context: Context) {
     // VIDEO RECORDING — direct mux (no transcode)
     //
     // The camera sends all-intra H.264 frames labeled as NAL type 1
-    // (non-IDR). Since every frame is independently decodable, we can
-    // mux them directly into MP4 by:
-    //   1. Rewriting NAL type 1 → 5 (IDR) so players treat them as keyframes
-    //   2. Converting Annex B start codes → AVCC length prefixes for MP4
-    //   3. Setting BUFFER_FLAG_KEY_FRAME so the sync sample table is correct
+    // (non-IDR). Since every frame is independently decodable, we mux
+    // them directly into MP4 with BUFFER_FLAG_KEY_FRAME set so every
+    // frame is a sync sample. The NAL type is left as-is (type 1) —
+    // rewriting to type 5 (IDR) corrupts playback because IDR slices
+    // have an extra idr_pic_id field in the slice header.
     //
     // This avoids the decoder+encoder transcode pipeline entirely, which
     // doesn't work on resource-limited devices (tablet's Snapdragon 429
@@ -354,9 +354,15 @@ class CaptureHelper(private val context: Context) {
     }
 
     /**
-     * Convert a single NAL unit from Annex B (start codes) to AVCC (length prefix)
-     * and write it to the muxer. Rewrites NAL type 1 → 5 (IDR) so players treat
-     * every frame as a keyframe (camera sends all-intra but labels them as non-IDR).
+     * Write a single NAL unit to the muxer. The Q2 camera sends all-intra frames
+     * labeled as NAL type 1 (non-IDR). We rewrite type 1 → 5 (IDR) so gallery
+     * apps can generate video thumbnails. BUFFER_FLAG_KEY_FRAME marks every
+     * frame as a sync sample for seeking.
+     *
+     * IMPORTANT: NAL payload must be copied into a clean byte array first.
+     * ByteBuffer.wrap(array, offset, len) with BufferInfo.offset=0 causes
+     * MediaMuxer to read from array start instead of buffer position,
+     * corrupting the last macroblocks (lower-right corner).
      */
     private fun muxNalUnit(data: ByteArray, offset: Int, length: Int, pts: Long) {
         if (!muxerStarted) return
@@ -366,28 +372,31 @@ class CaptureHelper(private val context: Context) {
         val payloadLen = length - (payloadStart - offset)
         if (payloadLen <= 0) return
 
-        // Rewrite NAL type: 1 (non-IDR) → 5 (IDR) so MP4 players can seek
-        val nalHeader = data[payloadStart].toInt() and 0xFF
+        // Copy NAL payload into a clean array — ByteBuffer.wrap(array, offset, len)
+        // is unreliable with MediaMuxer because BufferInfo.offset=0 can cause it to
+        // read from array start (the start code) instead of the buffer position
+        val nalPayload = ByteArray(payloadLen)
+        System.arraycopy(data, payloadStart, nalPayload, 0, payloadLen)
+
+        // Rewrite NAL type: 1 (non-IDR) → 5 (IDR) so gallery can generate thumbnails
+        // (Q2 camera sends all-intra frames labeled as type 1)
+        val nalHeader = nalPayload[0].toInt() and 0xFF
         val nalType = nalHeader and 0x1F
         if (nalType == 1) {
-            data[payloadStart] = ((nalHeader and 0xE0.toInt()) or 5).toByte()
+            nalPayload[0] = ((nalHeader and 0xE0.toInt()) or 5).toByte()
         }
 
-        // Build AVCC buffer: 4-byte big-endian length + NAL payload
-        val avccBuf = ByteBuffer.allocateDirect(4 + payloadLen)
-        avccBuf.putInt(payloadLen)
-        avccBuf.put(data, payloadStart, payloadLen)
-        avccBuf.flip()
+        val buf = ByteBuffer.wrap(nalPayload)
 
         val info = MediaCodec.BufferInfo().apply {
             this.offset = 0
-            this.size = 4 + payloadLen
+            this.size = nalPayload.size
             this.presentationTimeUs = pts
             this.flags = MediaCodec.BUFFER_FLAG_KEY_FRAME
         }
 
         try {
-            muxer!!.writeSampleData(videoTrackIndex, avccBuf, info)
+            muxer!!.writeSampleData(videoTrackIndex, buf, info)
         } catch (e: Exception) {
             Log.w(TAG, "Muxer write error on frame $frameCount: ${e.message}")
         }

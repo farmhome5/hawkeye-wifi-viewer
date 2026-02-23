@@ -130,6 +130,11 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
   Timer? _recordingTimer;
   bool _photoFlash = false; // brief visual feedback on photo capture
 
+  // Connection timeout — show WiFi hint after failing to connect
+  bool _showConnectionHint = false;
+  Timer? _connectionHintTimer;
+  static const int _connectionHintDelaySec = 10;
+
   @override
   void initState() {
     super.initState();
@@ -226,10 +231,12 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
         case 'playing':
           _reconnectAttempt = 0;
           _reconnectTimer?.cancel();
+          _connectionHintTimer?.cancel();
           if (mounted) {
             setState(() {
               _nativeSurfaceState = 'playing';
               _isRtspMode = true;
+              _showConnectionHint = false;
               final source = _wifiName ?? 'camera';
               _status = 'Streaming from $source';
             });
@@ -277,6 +284,7 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
             setState(() {
               _nativeSurfaceState = 'stopped';
               _isRtspMode = false;
+              _showConnectionHint = false;
               _status = 'Resuming...';
             });
             _probe();
@@ -523,6 +531,19 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
     });
   }
 
+  void _startConnectionHintTimer() {
+    if (_showConnectionHint) return; // already showing
+    if (_connectionHintTimer?.isActive == true) return; // already counting down
+    _connectionHintTimer = Timer(
+      const Duration(seconds: _connectionHintDelaySec),
+      () {
+        if (mounted && !_isRtspMode) {
+          setState(() => _showConnectionHint = true);
+        }
+      },
+    );
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
@@ -530,6 +551,7 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
     _connectivitySub?.cancel();
     _reconnectTimer?.cancel();
     _recordingTimer?.cancel();
+    _connectionHintTimer?.cancel();
     _nativeChannel.setMethodCallHandler(null);
     if (_isRecording) {
       _nativeChannel.invokeMethod('stop_recording').catchError((_) {});
@@ -550,6 +572,9 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
     _probeStartTime = DateTime.now();
     final myProbeId = _probeId; // Snapshot — if this changes, we've been superseded
     debugPrint('[HAWKEYE] _probe() #$myProbeId starting, ip=$_ip, fast=$fastReconnect');
+
+    // Start connection hint timer (shows WiFi notice after delay)
+    _startConnectionHintTimer();
 
     // Dispose old overlay to force a fresh decoder — prevents pixelation
     // from stale decoder state after reconnect/sleep/WiFi restore
@@ -889,7 +914,30 @@ class _LiveViewState extends State<LiveView> with WidgetsBindingObserver {
           if (!_isRtspMode)
             Container(
               color: const Color(0xFE000000),
-              child: const Center(child: CircularProgressIndicator()),
+              child: Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const CircularProgressIndicator(),
+                    if (_showConnectionHint) ...[
+                      const SizedBox(height: 24),
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 32),
+                        child: Text(
+                          'Unable to connect to camera.\n\n'
+                          'Please check that you are connected\n'
+                          'to the Q2 borescope WiFi network.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Colors.white70,
+                            fontSize: 14,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
             ),
           // Photo flash feedback
           if (_photoFlash)
