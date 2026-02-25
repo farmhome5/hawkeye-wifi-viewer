@@ -89,23 +89,34 @@ An `OnLayoutChangeListener` on the parent container detects dimension changes on
 - **Photos**: `PixelCopy.request()` on the SurfaceView → JPEG saved to `DCIM/{wifiName}/` via MediaStore (API 29+) or direct file + MediaScanner (API 24-28)
 - **Video**: Taps into the live view's NAL stream via `RtspSurfaceView.setDataListener()`:
   1. SPS/PPS fetched via lightweight RTSP DESCRIBE request (single TCP exchange, no SETUP/PLAY)
-  2. NAL payloads copied to clean byte arrays via `ArrayBlockingQueue` (decouples RTSP thread)
-  3. NAL type 1 rewritten to type 5 (IDR) for gallery thumbnail generation
-  4. Every frame marked as `BUFFER_FLAG_KEY_FRAME` (camera sends all-intra)
-  5. Saved to `DCIM/{wifiName}/`
+  2. PixelCopy captures live frame for thumbnail encoding (MediaCodec hardware encoder → IDR)
+  3. NAL payloads copied to clean byte arrays via `ArrayBlockingQueue` (decouples RTSP thread)
+  4. Camera NALs kept as type 1 (not rewritten) with `BUFFER_FLAG_KEY_FRAME`
+  5. Cover art JPEG embedded in MP4 `udta/meta/ilst` atom
+  6. Saved to `DCIM/{wifiName}/`
 - Recording automatically stops on `onStop()` or `overlay_dispose` (stream destruction)
 
 #### Direct Mux Approach
 
-Camera sends all H.264 frames as **non-IDR (NAL type 1)** but they are all-intra (independently decodable). The direct mux approach rewrites NAL type 1→5 and sets `BUFFER_FLAG_KEY_FRAME` so MP4 players treat every frame as a sync sample.
+Camera sends all H.264 frames as **non-IDR (NAL type 1)** but they are all-intra (independently decodable). The direct mux writes camera NALs as-is (type 1) with `BUFFER_FLAG_KEY_FRAME` so MP4 players treat every frame as a sync sample. NAL type 1→5 rewrite was removed because P-slice syntax (slice_type=0) is incompatible with IDR slice header structure.
 
 A transcode pipeline (decoder→encoder) was tried first but doesn't work on resource-limited devices — the tablet's Snapdragon 429 can't allocate a second hardware decoder (error 0x80001001), and the software decoder can't produce output from non-IDR frames.
+
+#### Thumbnail IDR (WIP — causes playback corruption)
+
+Samsung Gallery uses `getFrameAtTime(0)` for thumbnails (ignores cover art). Current approach:
+1. PixelCopy captures frame from live SurfaceView
+2. MediaCodec encoder produces IDR (~49KB) with rewritten SPS/PPS IDs (sps_id=1, pps_id=2)
+3. Encoder SPS profile/level bytes overwritten to match camera's (Main/5.1)
+4. Reset IDR (I_16x16 gray, 2.7KB) at PTS=1μs under camera SPS via CAVLC PPS (id=1)
+5. Camera frames follow at wall-clock timestamps
+
+**Problem**: ~2 seconds of corrupted playback after thumbnail. Root cause: encoder SPS and camera SPS differ in structural parameters (log2_max_frame_num: 4 vs 16, possibly others). Profile/level byte matching alone doesn't fix it. See `encodeFrameAsIdr()` and related NAL ID rewriting functions in CaptureHelper.kt.
 
 #### MediaMuxer Pitfalls
 
 - **Do NOT add AVCC length prefixes** — `MediaMuxer.writeSampleData()` handles them internally. Adding `putInt(len)` creates a double prefix that corrupts playback entirely.
 - **Do NOT use `ByteBuffer.wrap(array, offset, len)`** — with `BufferInfo.offset=0`, MediaMuxer may read from array start instead of buffer position, corrupting the lower-right corner of the video. Always copy NAL payload to a clean array first: `ByteBuffer.wrap(cleanArray)`.
-- **Gallery thumbnails**: NAL type 1→5 rewrite is intended to help, but Q2 thumbnails may still show a placeholder (IDR slice header mismatch with `idr_pic_id` field).
 
 ### Toolbar UI
 

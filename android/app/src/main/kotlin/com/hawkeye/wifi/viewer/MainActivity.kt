@@ -76,8 +76,10 @@ class MainActivity : FlutterActivity() {
                 "start_recording" -> {
                     val url = call.argument<String>("url") ?: ""
                     val wifiName = call.argument<String>("wifiName") ?: "Camera"
-                    val width = call.argument<Int>("width") ?: 400
-                    val height = call.argument<Int>("height") ?: 400
+                    // Use native-side video dimensions (from onRtspFrameSizeChanged)
+                    // which are always correct when stream is playing
+                    val w = if (videoWidth > 0) videoWidth else (call.argument<Int>("width") ?: 0)
+                    val h = if (videoHeight > 0) videoHeight else (call.argument<Int>("height") ?: 0)
                     val sv = overlaySurfaceView
                     if (url.isEmpty()) {
                         result.error("NO_URL", "RTSP URL required", null)
@@ -85,7 +87,7 @@ class MainActivity : FlutterActivity() {
                         result.error("NO_SURFACE", "Surface not available", null)
                     } else {
                         ensureCaptureHelper()
-                        captureHelper?.startRecording(sv, url, wifiName, width, height)
+                        captureHelper?.startRecording(sv, url, wifiName, w, h)
                         result.success(true)
                     }
                 }
