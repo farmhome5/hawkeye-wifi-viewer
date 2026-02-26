@@ -92,12 +92,13 @@ An `OnLayoutChangeListener` on the parent container detects dimension changes on
 - **Photos**: `PixelCopy.request()` on the SurfaceView → JPEG saved to `DCIM/{wifiName}/` via MediaStore (API 29+) or direct file + MediaScanner (API 24-28)
 - **Video**: Opens a headless `RtspClient` (second RTSP connection) for raw H.264 NAL capture:
   1. SPS/PPS fetched via lightweight RTSP DESCRIBE request (single TCP exchange, no SETUP/PLAY)
-  2. PixelCopy captures live frame for thumbnail encoding (MediaCodec hardware encoder → IDR)
+  2. PixelCopy captures live frame for cover art JPEG thumbnail
   3. Headless `RtspClient` opens second RTSP connection to camera (Q2 supports multiple clients)
   4. NAL payloads copied to clean byte arrays via `ArrayBlockingQueue` (decouples RTSP thread)
-  5. Camera NALs kept as type 1 (not rewritten) with `BUFFER_FLAG_KEY_FRAME`
-  6. Cover art JPEG embedded in MP4 `udta/meta/ilst` atom
-  7. Saved to `DCIM/{wifiName}/`
+  5. First frame prepended with inline Annex B SPS+PPS for decoder cold-start
+  6. Camera NALs kept as type 1 (not rewritten) with `BUFFER_FLAG_KEY_FRAME`
+  7. Cover art JPEG embedded in MP4 `udta/meta/ilst` atom
+  8. Saved to `DCIM/{wifiName}/`
 - Recording automatically stops on `onStop()` or `overlay_dispose` (stream destruction)
 - IJKPlayer doesn't expose raw NALs, hence the separate headless RtspClient for recording
 
@@ -107,16 +108,11 @@ Camera sends all H.264 frames as **non-IDR (NAL type 1)** but they are all-intra
 
 A transcode pipeline (decoder→encoder) was tried first but doesn't work on resource-limited devices — the tablet's Snapdragon 429 can't allocate a second hardware decoder (error 0x80001001), and the software decoder can't produce output from non-IDR frames.
 
-#### Thumbnail IDR (WIP — causes playback corruption)
+#### Thumbnail / Cover Art
 
-Samsung Gallery uses `getFrameAtTime(0)` for thumbnails (ignores cover art). Current approach:
-1. PixelCopy captures frame from live SurfaceView
-2. MediaCodec encoder produces IDR (~49KB) with rewritten SPS/PPS IDs (sps_id=1, pps_id=2)
-3. Encoder SPS profile/level bytes overwritten to match camera's (Main/5.1)
-4. Reset IDR (I_16x16 gray, 2.7KB) at PTS=1μs under camera SPS via CAVLC PPS (id=1)
-5. Camera frames follow at wall-clock timestamps
-
-**Problem**: ~2 seconds of corrupted playback after thumbnail. Root cause: encoder SPS and camera SPS differ in structural parameters (log2_max_frame_num: 4 vs 16, possibly others). Profile/level byte matching alone doesn't fix it. See `encodeFrameAsIdr()` and related NAL ID rewriting functions in CaptureHelper.kt.
+- **PixelCopy cover art**: Live frame captured at recording start, compressed as JPEG, embedded in MP4 `udta/meta/ilst/covr` atom. Works on newer Samsung Gallery (phone) but ignored by older Gallery (tablet).
+- **IDR transplant ABANDONED**: All approaches to inject an encoder IDR before camera P-slices cause playback corruption (DPB reset + P-slice reference mismatch). This is inherent and unfixable. See `memory/q2-thumbnail-investigation.md`.
+- **Inline SPS+PPS**: First video frame is prepended with `[start_code][SPS][start_code][PPS][start_code][frame]` so MediaMuxer writes each as a separate AVCC-prefixed NAL. Helps decoders cold-start from non-IDR frames.
 
 #### MediaMuxer Pitfalls
 
