@@ -1,12 +1,13 @@
 # Hawkeye WiFi Viewer
 
-RTSP video streaming app for Q2 WiFi borescope cameras. Flutter UI with native Kotlin MediaCodec integration.
+RTSP video streaming app for Q2 WiFi borescope cameras. Flutter UI with native Kotlin IJKPlayer integration.
 
 ## Tech Stack
 
 - **Flutter** (Dart) — UI layer, Material 3 dark theme
 - **Kotlin 2.2.0** — native Android bridge for RTSP video
-- **rtsp-client-android 5.6.3** — direct RTSP→MediaCodec pipeline for low-latency playback
+- **IJKPlayer** (FFmpeg + MediaCodec) — RTSP display with hardware decoding (from DVRunning2)
+- **rtsp-client-android 5.6.3** — headless RtspClient for video recording (NAL capture)
 - **Gradle Kotlin DSL** (Gradle 8.12, AGP 8.7.3)
 - Target SDK 36, Min SDK 24, Java 11
 
@@ -16,10 +17,12 @@ RTSP video streaming app for Q2 WiFi borescope cameras. Flutter UI with native K
 lib/                          # Flutter/Dart source (UI + logic)
 android/app/src/main/kotlin/  # Native Kotlin source
   com/hawkeye/wifi/viewer/
-    MainActivity.kt           # Flutter activity + native RTSP bridge via MethodChannel
-    NativeMediaCodecHelper.kt # RTSP→MediaCodec player with aspect ratio handling
+    MainActivity.kt           # Flutter activity + native bridge via MethodChannel
+    IjkPlayerHelper.kt        # IJKPlayer RTSP display with aspect ratio handling
     NativeVlcHelper.kt        # VlcEventCallback interface (shared event contract)
-    CaptureHelper.kt          # Photo capture (PixelCopy) + video recording (direct mux)
+    CaptureHelper.kt          # Photo capture (PixelCopy) + video recording (headless RtspClient)
+android/app/src/main/java/    # IJKPlayer Java classes (tv.danmaku.ijk.media.player)
+android/app/src/main/jniLibs/ # IJKPlayer native libs (libijkffmpeg.so, libijkplayer.so, libijksdl.so)
 android/app/build.gradle.kts  # App-level build config
 android/build.gradle.kts      # Project-level build config
 assets/HawkEyewifi.png        # App launcher icon source (256x256)
@@ -32,13 +35,13 @@ Source: `assets/HawkEyewifi.png`. Generated via `flutter_launcher_icons` (config
 
 ## Architecture
 
-RtspSurfaceView (aspect-ratio-sized) behind transparent Flutter UI (`TransparencyMode.transparent`). Flutter controls playback via MethodChannel (`hawkeye/native_vlc`). The rtsp-client-android library feeds RTSP/RTP H.264 NAL units directly into Android's hardware MediaCodec decoder — no intermediate buffering. Latency is ~100-300ms.
+Plain SurfaceView (aspect-ratio-sized) behind transparent Flutter UI (`TransparencyMode.transparent`). Flutter controls playback via MethodChannel (`hawkeye/native_vlc`). IJKPlayer (FFmpeg + MediaCodec) connects directly to the camera's RTSP URL and handles decoding/rendering.
 
-`NativeMediaCodecHelper` manages the RtspSurfaceView, handles aspect ratio sizing with margin-based centering, and forwards RTSP status events to Flutter via the `VlcEventCallback` interface. Low-latency SPS rewriting is enabled (`experimentalUpdateSpsFrameWithLowLatencyParams`) to force `maxDecFrameBuffering=1` and `numReorderFrames=0`.
+`IjkPlayerHelper` manages the SurfaceView and IJKPlayer instance, handles aspect ratio sizing with margin-based centering, and forwards player events to Flutter via the `VlcEventCallback` interface. IJKPlayer is configured with DVRunning2's low-latency options (mediacodec, nobuffer, udp transport, etc.).
 
 ### Event Flow
 
-RTSP events flow: `RtspStatusListener` → `NativeMediaCodecHelper` → `VlcEventCallback` → `MainActivity` → MethodChannel `nativeEvent` → Flutter `_onNativeMethodCall`. Events: `playing`, `error`, `ended`, `stopped`, `videoSize`, `foregrounded`.
+IJKPlayer events flow: `IjkMediaPlayer` listeners → `IjkPlayerHelper` → `VlcEventCallback` → `MainActivity` → MethodChannel `nativeEvent` → Flutter `_onNativeMethodCall`. Events: `playing`, `error`, `ended`, `stopped`, `videoSize`, `foregrounded`.
 
 Auto-reconnect uses a two-tier strategy: fast replay (first 3 attempts at 1s intervals with full dispose+init cycle) then falls back to full probe with exponential backoff (1s-8s). Max 10 total attempts. Only one RTSP URL is tried per probe cycle to avoid flooding the camera's single-client RTSP server.
 
@@ -70,11 +73,11 @@ A 10-second timer shows "check Q2 borescope WiFi network" when the camera is unr
 
 ### Screen Wake Lock
 
-`keepScreenOn` is set on the RtspSurfaceView when the stream starts playing, and cleared when it stops. This prevents the device from sleeping while actively streaming.
+`keepScreenOn` is set on the SurfaceView when the stream starts playing, and cleared when it stops. This prevents the device from sleeping while actively streaming.
 
 ### Aspect Ratio Handling
 
-RtspSurfaceView does NOT handle aspect ratio internally — it stretches to fill its view bounds. `NativeMediaCodecHelper.updateViewAspectRatio()` calculates correct view dimensions from the video's aspect ratio and parent container size, then applies FrameLayout.LayoutParams with margins to center the view. This is called on `onRtspFrameSizeChanged` and on parent layout changes (rotation).
+IJKPlayer renders to a plain SurfaceView which stretches to fill its view bounds. `IjkPlayerHelper.updateViewAspectRatio()` calculates correct view dimensions from the video's aspect ratio and parent container size, then applies FrameLayout.LayoutParams with margins to center the view. This is called on `onVideoSizeChanged` and on parent layout changes (rotation).
 
 Do NOT use Gravity.CENTER — FlutterView's layout system does not reliably honor FrameLayout gravity on child views during config changes. Use margin-based centering instead.
 
@@ -87,14 +90,16 @@ An `OnLayoutChangeListener` on the parent container detects dimension changes on
 `CaptureHelper.kt` handles both photo capture and video recording:
 
 - **Photos**: `PixelCopy.request()` on the SurfaceView → JPEG saved to `DCIM/{wifiName}/` via MediaStore (API 29+) or direct file + MediaScanner (API 24-28)
-- **Video**: Taps into the live view's NAL stream via `RtspSurfaceView.setDataListener()`:
+- **Video**: Opens a headless `RtspClient` (second RTSP connection) for raw H.264 NAL capture:
   1. SPS/PPS fetched via lightweight RTSP DESCRIBE request (single TCP exchange, no SETUP/PLAY)
   2. PixelCopy captures live frame for thumbnail encoding (MediaCodec hardware encoder → IDR)
-  3. NAL payloads copied to clean byte arrays via `ArrayBlockingQueue` (decouples RTSP thread)
-  4. Camera NALs kept as type 1 (not rewritten) with `BUFFER_FLAG_KEY_FRAME`
-  5. Cover art JPEG embedded in MP4 `udta/meta/ilst` atom
-  6. Saved to `DCIM/{wifiName}/`
+  3. Headless `RtspClient` opens second RTSP connection to camera (Q2 supports multiple clients)
+  4. NAL payloads copied to clean byte arrays via `ArrayBlockingQueue` (decouples RTSP thread)
+  5. Camera NALs kept as type 1 (not rewritten) with `BUFFER_FLAG_KEY_FRAME`
+  6. Cover art JPEG embedded in MP4 `udta/meta/ilst` atom
+  7. Saved to `DCIM/{wifiName}/`
 - Recording automatically stops on `onStop()` or `overlay_dispose` (stream destruction)
+- IJKPlayer doesn't expose raw NALs, hence the separate headless RtspClient for recording
 
 #### Direct Mux Approach
 
@@ -133,7 +138,7 @@ Right-side vertical toolbar (V3 View style) replaces the old bottom capture bar.
 
 ### Native Video Insets
 
-`NativeMediaCodecHelper` supports reserved insets (`setReservedInsets`) so Flutter can reserve space for the toolbar. Video is aspect-ratio-fitted within the available area after subtracting insets, then centered with margin-based positioning. Flutter sends insets via `overlay_setInsets` MethodChannel call on orientation change.
+`IjkPlayerHelper` supports reserved insets (`setReservedInsets`) so Flutter can reserve space for the toolbar. Video is aspect-ratio-fitted within the available area after subtracting insets, then centered with margin-based positioning. Flutter sends insets via `overlay_setInsets` MethodChannel call on orientation change.
 
 ## MethodChannel API
 
@@ -171,7 +176,7 @@ cd android && ./gradlew assembleDebug
 
 - Native Kotlin follows standard Android conventions (PascalCase classes, camelCase functions)
 - Flutter/Dart follows standard Dart conventions (snake_case files, camelCase variables, PascalCase classes)
-- RTSP/MediaCodec configuration changes go in `NativeMediaCodecHelper.kt`
+- IJKPlayer configuration changes go in `IjkPlayerHelper.kt`
 - Cleartext HTTP traffic is allowed (required for local camera streams)
 - Impeller is disabled; Skia renderer is used for stable compositing with native SurfaceView
 
@@ -183,7 +188,8 @@ cd android && ./gradlew assembleDebug
 - `permission_handler` — runtime permissions
 
 **Android (build.gradle.kts):**
-- `com.github.alexeyvasilyev:rtsp-client-android:5.6.3` — direct RTSP→MediaCodec (via JitPack)
+- **IJKPlayer** — FFmpeg+MediaCodec RTSP display (native libs in `jniLibs/arm64-v8a/`, Java in `java/tv/danmaku/`)
+- `com.github.alexeyvasilyev:rtsp-client-android:5.6.3` — headless RtspClient for recording (via JitPack)
 
 ## Permissions
 
@@ -191,7 +197,7 @@ INTERNET, ACCESS_WIFI_STATE, ACCESS_NETWORK_STATE, ACCESS_FINE_LOCATION, CHANGE_
 
 ## Known Considerations
 
-- ProGuard keeps rtsp-client-android classes (`com.alexvas.**`) and app classes
+- ProGuard keeps IJKPlayer (`tv.danmaku.ijk.**`), rtsp-client-android (`com.alexvas.**`), and app classes
 - No automated tests or CI/CD currently configured
 - Test tablet: Samsung SM-T290, device ID `R9WN809CT0J`
 - Test phone: Samsung SM-S926U, device ID `R5CX15DGA2H`

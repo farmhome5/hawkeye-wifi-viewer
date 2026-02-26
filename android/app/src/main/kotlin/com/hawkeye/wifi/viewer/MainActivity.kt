@@ -1,9 +1,9 @@
 package com.hawkeye.wifi.viewer
 
 import android.util.Log
+import android.view.SurfaceView
 import android.view.ViewGroup
 import android.widget.FrameLayout
-import com.alexvas.rtsp.widget.RtspSurfaceView
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.android.TransparencyMode
 import io.flutter.embedding.engine.FlutterEngine
@@ -17,8 +17,8 @@ class MainActivity : FlutterActivity() {
     }
 
     private var methodChannel: MethodChannel? = null
-    private var overlaySurfaceView: RtspSurfaceView? = null
-    private var mediaHelper: NativeMediaCodecHelper? = null
+    private var overlaySurfaceView: SurfaceView? = null
+    private var playerHelper: IjkPlayerHelper? = null
     private var captureHelper: CaptureHelper? = null
     private var videoWidth: Int = 0
     private var videoHeight: Int = 0
@@ -53,11 +53,11 @@ class MainActivity : FlutterActivity() {
                     val top = call.argument<Int>("top") ?: 0
                     val right = call.argument<Int>("right") ?: 0
                     val bottom = call.argument<Int>("bottom") ?: 0
-                    mediaHelper?.setReservedInsets(left, top, right, bottom)
+                    playerHelper?.setReservedInsets(left, top, right, bottom)
                     result.success(true)
                 }
                 "overlay_isPlaying" -> {
-                    result.success(mediaHelper?.isPlaying == true)
+                    result.success(playerHelper?.isPlaying == true)
                 }
                 "overlay_getVideoSize" -> {
                     result.success(mapOf("width" to videoWidth, "height" to videoHeight))
@@ -190,17 +190,17 @@ class MainActivity : FlutterActivity() {
             return
         }
 
-        Log.d(TAG, "overlay_init: creating RtspSurfaceView behind Flutter")
+        Log.d(TAG, "overlay_init: creating IJKPlayer SurfaceView behind Flutter")
 
         val root = findViewById<ViewGroup>(android.R.id.content)
         val container = root.getChildAt(0) as? ViewGroup ?: root
 
-        if (mediaHelper == null) {
-            mediaHelper = NativeMediaCodecHelper(applicationContext)
+        if (playerHelper == null) {
+            playerHelper = IjkPlayerHelper(applicationContext)
         }
-        mediaHelper?.eventCallback = playerCallback
+        playerHelper?.eventCallback = playerCallback
 
-        overlaySurfaceView = mediaHelper!!.createSurfaceView().apply {
+        overlaySurfaceView = playerHelper!!.createSurfaceView().apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
@@ -208,19 +208,19 @@ class MainActivity : FlutterActivity() {
         }
 
         container.addView(overlaySurfaceView, 0)
-        mediaHelper?.setupParentLayoutListener()
+        playerHelper?.setupParentLayoutListener()
     }
 
     private fun overlayPlay(url: String) {
         if (overlaySurfaceView == null) {
             overlayInit()
         }
-        mediaHelper?.play(url)
+        playerHelper?.play(url)
         Log.d(TAG, "overlay playing: $url")
     }
 
     private fun overlayStop() {
-        mediaHelper?.stop()
+        playerHelper?.stop()
         Log.d(TAG, "overlay stopped")
     }
 
@@ -232,9 +232,9 @@ class MainActivity : FlutterActivity() {
         }
         videoWidth = 0
         videoHeight = 0
-        mediaHelper?.eventCallback = null
-        mediaHelper?.release()
-        mediaHelper = null
+        playerHelper?.eventCallback = null
+        playerHelper?.release()
+        playerHelper = null
 
         overlaySurfaceView?.let { sv ->
             (sv.parent as? ViewGroup)?.removeView(sv)
