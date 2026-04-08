@@ -1,6 +1,7 @@
 name: hawkeye_wifi_viewer
 description: Hawkeye WiFi Viewer
 publish_to: "none"
+version: 1.0.1+2
 
 environment:
   sdk: ">=3.0.0 <4.0.0"
@@ -23,7 +24,7 @@ flutter_launcher_icons:
   android: true
   ios: false
   image_path: "assets/Q2 wifi.png"
-  adaptive_icon_background: "#1a1a2e"
+  adaptive_icon_background: "#ffffff"
   adaptive_icon_foreground: "assets/Q2 wifi.png"
 
 flutter:

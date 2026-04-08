@@ -10,7 +10,7 @@
 <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
 <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
         <application
-    android:label="Hawkeye WiFi Viewer"
+    android:label="Hawkeye Q2 Wifi"
     android:name="${applicationName}"
     android:icon="@mipmap/ic_launcher"
     android:usesCleartextTraffic="true">
